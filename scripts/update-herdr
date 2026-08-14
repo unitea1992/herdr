@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# update-herdr — Linux-only updater for the personal herdr fork
+# (unitea1992/herdr, branch local/tabby-cwd). This script is the source of
+# truth; the installer copies it to $BIN_DIR/update-herdr.
+#
+# Usage: update-herdr [--check] [--clean]
+#   no flags  fetch upstream+origin, rebase local/tabby-cwd onto
+#             upstream/master, force-push the fork, build the release binary
+#             with custom version metadata, install it to $BIN_DIR/herdr.
+#   --check   same fetch/rebase/push, then run Linux-native checks (fmt,
+#             clippy, nextest, release build) WITHOUT installing anything.
+#   --clean   `cargo clean` before the build (use after repo moves when stale
+#             cache paths break the vendored zig build).
+#
+# This fork is Linux-only: never installs or runs Windows/macOS targets,
+# PowerShell tooling, or the official updater (`herdr update` is blocked by
+# the .bashrc wrapper). Checks never depend on `just`.
+set -euo pipefail
+
+REPO="${HERDR_LOCAL_REPO:-$HOME/projects/herdr}"
+BIN_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
+BRANCH="local/tabby-cwd"
+BINARY="$BIN_DIR/herdr"
+ZIG_VERSION="0.15.2"
+
+check_mode=0
+clean_mode=0
+for arg in "$@"; do
+    case "$arg" in
+        --check) check_mode=1 ;;
+        --clean) clean_mode=1 ;;
+        *)
+            echo "usage: update-herdr [--check] [--clean]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || die "required command '$cmd' is not on PATH"
+}
+
+# Resolve a zig binary that is exactly $ZIG_VERSION: PATH first, then
+# $HOME/.local/bin/zig. Prints the command/path to use for the build.
+# Other zig versions on PATH are left untouched; only the exact one is used.
+resolve_zig() {
+    if command -v zig >/dev/null 2>&1 && [[ "$(zig version 2>/dev/null)" == "$ZIG_VERSION" ]]; then
+        echo "zig"
+        return
+    fi
+    local candidate="$HOME/.local/bin/zig"
+    if [[ -x "$candidate" ]] && [[ "$("$candidate" version 2>/dev/null)" == "$ZIG_VERSION" ]]; then
+        echo "$candidate"
+        return
+    fi
+    local arch
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+    echo "ERROR: zig $ZIG_VERSION is required for the herdr build." >&2
+    if [[ -x "$candidate" ]]; then
+        echo "  $candidate is version $("$candidate" version 2>/dev/null)" >&2
+    fi
+    echo "Install in user space (no root):" >&2
+    echo "  curl -fsSL https://ziglang.org/download/$ZIG_VERSION/zig-$arch-linux-$ZIG_VERSION.tar.xz" >&2
+    exit 1
+}
+
+preflight_build_deps() {
+    require_cmd cargo
+    require_cmd rustc
+    ZIG="$(resolve_zig)"
+    export ZIG
+}
+
+preflight_check_deps() {
+    preflight_build_deps
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        cat >&2 <<'EOF'
+ERROR: cargo-nextest is required for --check.
+Install with:
+  cargo binstall cargo-nextest --no-confirm
+EOF
+        exit 1
+    fi
+    cargo fmt --version >/dev/null 2>&1 || die "rustfmt is missing; install with: rustup component add rustfmt"
+    cargo clippy --version >/dev/null 2>&1 || die "clippy is missing; install with: rustup component add clippy"
+}
+
+build_and_install() {
+    preflight_build_deps
+    if [[ "$clean_mode" == 1 ]]; then
+        echo "== cargo clean =="
+        cargo clean
+    fi
+    local head_sha
+    head_sha="$(git rev-parse --short HEAD)"
+    echo "== cargo build --release (channel=tabbycwd, id=$head_sha) =="
+    HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$head_sha" cargo build --release --locked
+    echo "== install to $BINARY =="
+    install -Dm755 target/release/herdr "$BINARY"
+}
+
+run_checks() {
+    preflight_check_deps
+    if [[ "$clean_mode" == 1 ]]; then
+        echo "== cargo clean =="
+        cargo clean
+    fi
+    local head_sha
+    head_sha="$(git rev-parse --short HEAD)"
+    export HERDR_BUILD_CHANNEL=tabbycwd
+    export HERDR_BUILD_ID="$head_sha"
+
+    echo "== cargo fmt --check =="
+    cargo fmt --check
+    echo "== cargo clippy --all-targets --locked -- -D warnings =="
+    cargo clippy --all-targets --locked -- -D warnings
+    echo "== cargo nextest run --locked =="
+    cargo nextest run --locked \
+        --status-level fail \
+        --final-status-level slow \
+        --failure-output final \
+        --success-output never
+    echo "== cargo build --release --locked (no install) =="
+    cargo build --release --locked
+}
+
+main() {
+    cd "$REPO" || die "repo not found at $REPO (run the one-line installer first, see LOCAL.md)"
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        echo "error: working tree is dirty; commit or stash before updating" >&2
+        git status --short >&2
+        exit 1
+    fi
+    if [[ "$(git branch --show-current)" != "$BRANCH" ]]; then
+        echo "error: expected branch '$BRANCH', currently on '$(git branch --show-current)'" >&2
+        exit 1
+    fi
+    git remote get-url upstream >/dev/null 2>&1 || die "remote 'upstream' missing (add: git remote add upstream https://github.com/herdrdev/herdr.git)"
+    git remote get-url origin >/dev/null 2>&1 || die "remote 'origin' missing"
+
+    local upstream_before
+    upstream_before="$(git rev-parse --short upstream/master)"
+
+    echo "== fetch upstream + origin =="
+    git fetch upstream
+    git fetch origin
+
+    local upstream_after
+    upstream_after="$(git rev-parse --short upstream/master)"
+
+    echo "== rebase $BRANCH onto upstream/master =="
+    if ! git rebase upstream/master; then
+        echo
+        echo "error: rebase conflicts; resolve manually, then run: git rebase --continue" >&2
+        echo "conflicted files:" >&2
+        git diff --name-only --diff-filter=U >&2
+        exit 1
+    fi
+
+    echo "== push $BRANCH to origin (--force-with-lease) =="
+    git push --force-with-lease origin "$BRANCH"
+
+    if [[ "$check_mode" == 1 ]]; then
+        run_checks
+    else
+        build_and_install
+    fi
+
+    echo
+    echo "Upstream before: $upstream_before"
+    echo "Upstream after:  $upstream_after"
+    echo "Local HEAD:      $(git rev-parse --short HEAD)"
+    echo
+    if [[ "$check_mode" == 1 ]]; then
+        echo "check mode: Linux-native checks passed; installed binary untouched"
+    fi
+    "$BINARY" --version
+    echo "note: a running herdr server is still the old binary; restart it at a convenient time"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
