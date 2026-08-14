@@ -100,19 +100,33 @@ ensure_nextest() {
     cargo binstall cargo-nextest --no-confirm
 }
 
+# Zig 0.15.2 is kept as a complete distribution tree (zig binary + lib/ +
+# docs) under $HOME/.local/share/herdr/zig-$ZIG_VERSION/. A lone `zig` binary
+# cannot find its lib/ for the vendored libghostty-vt build, so we never drop
+# a bare binary into $HOME/.local/bin/zig. Resolution order: our managed
+# complete tree first, then an exact-version PATH zig whose real location has
+# a lib/ next to it (realpath so symlinked installs work), then install.
+zig_complete() {
+    local real
+    real="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+    [[ -x "$real" ]] && [[ -d "${real%/*}/lib" ]]
+}
+
 ensure_zig() {
-    if command -v zig >/dev/null 2>&1 && [[ "$(zig version 2>/dev/null)" == "$ZIG_VERSION" ]]; then
-        say "zig $ZIG_VERSION found on PATH"
+    local managed="$HOME/.local/share/herdr/zig-$ZIG_VERSION/zig"
+    if zig_complete "$managed"; then
+        say "zig $ZIG_VERSION installation found at ${managed%/*}"
+        ZIG_BIN="$managed"
+        return
+    fi
+    if command -v zig >/dev/null 2>&1 \
+        && [[ "$(zig version 2>/dev/null)" == "$ZIG_VERSION" ]] \
+        && zig_complete "$(command -v zig)"; then
+        say "zig $ZIG_VERSION complete installation found on PATH"
         ZIG_BIN="zig"
         return
     fi
-    local candidate="$HOME/.local/bin/zig"
-    if [[ -x "$candidate" ]] && [[ "$("$candidate" version 2>/dev/null)" == "$ZIG_VERSION" ]]; then
-        say "zig $ZIG_VERSION found at $candidate"
-        ZIG_BIN="$candidate"
-        return
-    fi
-    say "installing zig $ZIG_VERSION to $HOME/.local/bin/zig (user space; other zig versions untouched)"
+    say "installing zig $ZIG_VERSION to ${managed%/*} (user space; other zig versions untouched)"
     local arch tarball extracted tmp
     arch="$(uname -m)"
     case "$arch" in
@@ -125,8 +139,11 @@ ensure_zig() {
     trap 'rm -rf "$tmp"' RETURN
     curl -fsSL -o "$tmp/$tarball" "https://ziglang.org/download/$ZIG_VERSION/$tarball"
     tar -C "$tmp" -xf "$tmp/$tarball"
-    install -Dm755 "$tmp/$extracted/zig" "$HOME/.local/bin/zig"
-    ZIG_BIN="$HOME/.local/bin/zig"
+    local root="$(dirname "$managed")"
+    mkdir -p "$(dirname "$root")"
+    rm -rf "$root"  # herdr-owned tree only; never touches ~/.local/bin/zig
+    cp -a "$tmp/$extracted" "$root"
+    ZIG_BIN="$root/zig"
 }
 
 ensure_repo() {

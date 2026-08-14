@@ -37,8 +37,13 @@ cwd に追従します。
 ## 依存ツール
 
 - **Zig 0.15.2 固定**(vendored libghostty-vt)。自動アップグレードはしません。
-  PATH 上の別バージョンの zig には触れず、ビルドは `ZIG=<path>` でこの
-  バージョンに固定します(PATH の zig 優先、次に `$HOME/.local/bin/zig`)。
+  Zig は単体バイナリでは動作せず `lib/` を含む配布ツリー全体が必要なので、
+  `$HOME/.local/share/herdr/zig-$ZIG_VERSION/` に完全ツリー(zig + lib/ +
+  docs)として保持し、ビルドは `ZIG=<そのzigへの絶対パス>` で固定します。
+  解決順: ① 管理対象の完全ツリー、② PATH 上の完全な 0.15.2、③ インストーラ
+  によるインストール(アップデータはエラー)。`$HOME/.local/bin/zig` は
+  PATH 上の他の zig を壊さないために一切使いません(旧インストーラが
+  作った壊れた単体 zig がそこにあっても無視し、削除もしません)。
 - Rust CLI は **cargo-binstall** で管理します(ユーザ空間、sudo/apt 不要):
   `cargo-binstall` 本体と `cargo-nextest`(`update-herdr --check` でのみ必要)。
 - インストーラと `--check` は `just` を使わないため、PATH に古い apt の
@@ -55,7 +60,8 @@ cwd に追従します。
 - `HERDR_LOCAL_BIN` — バイナリ配置ディレクトリ(デフォルト `$HOME/.local/bin`)
 
 インストーラは冪等(再実行しても安全)で、dirty なチェックアウトには触れません。
-rustup/cargo-binstall/cargo-nextest/Zig 0.15.2 が無い場合だけインストールし、
+rustup/cargo-binstall/cargo-nextest/Zig 0.15.2 の完全ツリー
+(`$HOME/.local/share/herdr/zig-0.15.2/`)が無い場合だけインストールし、
 フォークを clone、リモートを設定、`local/tabby-cwd` を checkout、
 `upstream/master` に遅れていれば rebase(コンフリクトは自動解決しません)、
 独自の version metadata 付きでビルドし、バイナリと `scripts/update-herdr` を
@@ -85,8 +91,8 @@ marker でガードされ、二重に追記されることはありません。
   --locked -- -D warnings`、`cargo nextest run --locked ...`、`cargo build
   --release --locked`)を**インストールなしで**実行します。
   `x86_64-pc-windows-msvc` ターゲットは追加せず、Windows/macOS の lint も
-  実行しません。不足している依存は自動インストールせず、インストール
-  コマンドとともにエラー終了します。
+  実行しません。不足している依存(zig の完全ツリー含む)は自動インストール
+  せず、installer への誘導とともにエラー終了します。
 - `update-herdr --clean` — 通常の update/build の前に `cargo clean` を実行。
   リポジトリ移動後に、キャッシュされた古いパスが vendored の zig build を
   壊す場合(`cannot find -lghostty-vt`)に使います。通常の update では

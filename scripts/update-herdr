@@ -46,27 +46,35 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "required command '$cmd' is not on PATH"
 }
 
-# Resolve a zig binary that is exactly $ZIG_VERSION: PATH first, then
-# $HOME/.local/bin/zig. Prints the command/path to use for the build.
-# Other zig versions on PATH are left untouched; only the exact one is used.
+# Resolve zig 0.15.2 as a complete installation (zig binary + lib/ + docs
+# tree), the layout the installer keeps under
+# $HOME/.local/share/herdr/zig-$ZIG_VERSION/. Resolution: the herdr-managed
+# complete tree first (this also heals the old broken lone $HOME/.local/bin/zig
+# layout), then an exact-version PATH zig whose real location has a lib/ next
+# to it. A bare single zig binary is never usable (Zig needs its installation
+# tree for the vendored libghostty-vt build), so it is never picked.
+zig_complete() {
+    local real
+    real="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+    [[ -x "$real" ]] && [[ -d "${real%/*}/lib" ]]
+}
+
 resolve_zig() {
-    if command -v zig >/dev/null 2>&1 && [[ "$(zig version 2>/dev/null)" == "$ZIG_VERSION" ]]; then
+    local managed="$HOME/.local/share/herdr/zig-$ZIG_VERSION/zig"
+    if zig_complete "$managed"; then
+        echo "$managed"
+        return
+    fi
+    if command -v zig >/dev/null 2>&1 \
+        && [[ "$(zig version 2>/dev/null)" == "$ZIG_VERSION" ]] \
+        && zig_complete "$(command -v zig)"; then
         echo "zig"
         return
     fi
-    local candidate="$HOME/.local/bin/zig"
-    if [[ -x "$candidate" ]] && [[ "$("$candidate" version 2>/dev/null)" == "$ZIG_VERSION" ]]; then
-        echo "$candidate"
-        return
-    fi
-    local arch
-    arch="$(uname -m 2>/dev/null || echo unknown)"
-    echo "ERROR: zig $ZIG_VERSION is required for the herdr build." >&2
-    if [[ -x "$candidate" ]]; then
-        echo "  $candidate is version $("$candidate" version 2>/dev/null)" >&2
-    fi
-    echo "Install in user space (no root):" >&2
-    echo "  curl -fsSL https://ziglang.org/download/$ZIG_VERSION/zig-$arch-linux-$ZIG_VERSION.tar.xz" >&2
+    echo "ERROR: zig $ZIG_VERSION (complete installation with lib/) is required." >&2
+    echo "  managed tree $HOME/.local/share/herdr/zig-$ZIG_VERSION is missing or incomplete." >&2
+    echo "  Install/repair it with the one-line installer:" >&2
+    echo "    curl -fsSL https://raw.githubusercontent.com/unitea1992/herdr/local/tabby-cwd/install-tabbycwd.sh | bash" >&2
     exit 1
 }
 

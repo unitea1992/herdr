@@ -39,10 +39,14 @@ export HERDR_LOCAL_BIN="$HOME/.local/bin"
 source "$INSTALLER"
 source "$UPDATER"
 
-make_zig() { # $1=version $2=path (#!/bin/bash: PATH is stubbed in tests, env cannot resolve bash)
+make_zig() { # $1=version $2=path; bare binary, no lib/ (old broken installer output)
     mkdir -p "$(dirname "$2")"
     printf '#!/bin/bash\nif [[ "${1:-}" == "version" ]]; then echo "%s"; fi\n' "$1" > "$2"
     chmod +x "$2"
+}
+make_zig_tree() { # $1=version $2=bin-path; complete layout: zig + sibling lib/
+    make_zig "$1" "$2"
+    mkdir -p "$(dirname "$2")/lib"
 }
 
 # --- linux-only guard -------------------------------------------------------
@@ -55,37 +59,92 @@ if (PATH="$fakebin" require_linux) >/dev/null 2>&1; then
 fi
 ok "require_linux rejects non-Linux"
 
-# --- zig detection (installer + updater) ------------------------------------
+# --- zig: complete-tree layout (installer + updater) -------------------------
+# Resolution never depends on $HOME/.local/bin/zig, other PATH zigs are left
+# untouched, and the tarball fixture installs as a complete tree.
+ZIG_ROOT="$HOME/.local/share/herdr/zig-$ZIG_VERSION"
+
+# A complete 0.15.2 on PATH is reused, nothing installed.
 zigpath="$tmp/zigpath"
 mkdir -p "$zigpath"
-make_zig 0.15.2 "$zigpath/zig"
+make_zig_tree 0.15.2 "$zigpath/zig"
 got="$(PATH="$zigpath" resolve_zig)"
-[[ "$got" == "zig" ]] || fail "resolve_zig did not pick PATH zig (got: $got)"
+[[ "$got" == "zig" ]] || fail "resolve_zig did not pick complete PATH zig (got: $got)"
 PATH="$zigpath" ensure_zig
 [[ "${ZIG_BIN:-}" == "zig" ]] || fail "ensure_zig did not set ZIG_BIN=zig"
-ok "zig 0.15.2 on PATH detected"
+ok "complete zig 0.15.2 on PATH re-used"
 
-make_zig 0.14.0 "$zigpath/zig"   # wrong version on PATH
-make_zig 0.15.2 "$HOME/.local/bin/zig"
+# Wrong-version PATH zig untouched; managed tree preferred (also covers the
+# old broken ~/.local/bin/zig from the previous installer layout).
+managedbin="$ZIG_ROOT/zig"
+make_zig_tree 0.15.2 "$managedbin"
+make_zig 0.14.0 "$zigpath/zig"
+make_zig 0.15.2 "$HOME/.local/bin/zig"   # old broken standalone, no lib/
 got="$(PATH="$zigpath" resolve_zig)"
-[[ "$got" == "$HOME/.local/bin/zig" ]] || fail "resolve_zig did not fall back to \$HOME/.local/bin/zig (got: $got)"
+[[ "$got" == "$managedbin" ]] || fail "resolve_zig did not prefer managed tree (got: $got)"
 PATH="$zigpath" ensure_zig
-[[ "${ZIG_BIN:-}" == "$HOME/.local/bin/zig" ]] || fail "ensure_zig did not use \$HOME/.local/bin/zig"
-ok "wrong PATH zig falls back to \$HOME/.local/bin/zig 0.15.2 (other versions untouched)"
+[[ "${ZIG_BIN:-}" == "$managedbin" ]] || fail "ensure_zig did not prefer managed tree"
+ok "managed complete tree preferred; PATH other-zig untouched"
 
-rm -f "$HOME/.local/bin/zig"
+# Missing managed tree + bare old-standalone on PATH -> clean error, never
+# deletes the file (could be anyone's zig).
+rm -rf "$ZIG_ROOT"
 if out="$(PATH="$zigpath" resolve_zig 2>&1)"; then
-    fail "resolve_zig succeeded with no zig 0.15.2 available"
+    fail "resolve_zig succeeded with no complete zig available"
 fi
 echo "$out" | grep -q 'zig 0.15.2' || fail "missing zig error message"
-ok "missing zig 0.15.2 errors with install hint"
+[[ -f "$HOME/.local/bin/zig" ]] || fail "old broken ~/.local/bin/zig was deleted"
+ok "no complete zig: errors, never uses/deletes ~/.local/bin/zig"
+
+# Full install path: tarball fixture (zig + lib/) becomes the complete tree,
+# and installer re-run is idempotent. curl is stubbed to serve the fixture.
+if command -v xz >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    arch="$(uname -m)"
+    extracted="zig-$arch-linux-$ZIG_VERSION"
+    fixture_root="$tmp/fixture"
+    mkdir -p "$fixture_root/$extracted/lib"
+    printf '#!/bin/bash\nif [[ "${1:-}" == "version" ]]; then echo "%s"; fi\n' "$ZIG_VERSION" > "$fixture_root/$extracted/zig"
+    chmod +x "$fixture_root/$extracted/zig"
+    fixture_tarball="$tmp/zig.tar.xz"
+    (cd "$fixture_root" && tar -cJf "$fixture_tarball" "$extracted")
+
+    fakecurl="$tmp/fakecurl"
+    mkdir -p "$fakecurl"
+    printf '%s\n' \
+        '#!/bin/bash' \
+        '# fake curl: copy the fixture tarball to the -o target; URL irrelevant.' \
+        'prev=' \
+        'for arg in "$@"; do' \
+        '    if [[ "$prev" == "-o" ]]; then target="$arg"; fi' \
+        '    prev="$arg"' \
+        'done' \
+        'cp "$TEST_TARBALL" "$target"' \
+        > "$fakecurl/curl"
+    chmod +x "$fakecurl/curl"
+    export TEST_TARBALL="$fixture_tarball"
+
+    rm -f "$HOME/.local/bin/zig"   # clear the leftover from the case above
+    PATH="$fakecurl:/usr/bin:/bin" ensure_zig
+    [[ "${ZIG_BIN:-}" == "$ZIG_ROOT/zig" ]] || fail "ZIG_BIN not inside complete tree (got: ${ZIG_BIN:-})"
+    [[ -x "$ZIG_ROOT/zig" ]] || fail "managed zig binary missing after install"
+    [[ -d "$ZIG_ROOT/lib" ]] || fail "managed lib/ missing after install"
+    [[ ! -e "$HOME/.local/bin/zig" ]] || fail "installer must not touch ~/.local/bin"
+    ok "tarball fixture installed as complete tree (zig + lib/) at $ZIG_ROOT"
+
+    PATH="$fakecurl:/usr/bin:/bin" ensure_zig   # re-run
+    [[ "${ZIG_BIN:-}" == "$ZIG_ROOT/zig" ]] || fail "re-run changed ZIG_BIN"
+    [[ -x "$ZIG_ROOT/zig" && -d "$ZIG_ROOT/lib" ]] || fail "complete tree lost on re-run"
+    ok "installer re-run idempotent (complete tree kept)"
+else
+    ok "xz/tar absent — full-tree fixture test skipped"
+fi
 
 # --- dependency preflight (updater, report-only) -----------------------------
 shim="$tmp/shim"
 mkdir -p "$shim" "$tmp/emptybin"
 printf '#!/bin/bash\necho "cargo 1.85.0 (fake)"\n' > "$shim/cargo"
 printf '#!/bin/bash\necho "rustc 1.85.0 (fake)"\n' > "$shim/rustc"
-make_zig 0.15.2 "$shim/zig"
+make_zig_tree 0.15.2 "$shim/zig"
 chmod +x "$shim/cargo" "$shim/rustc"
 
 if out="$(PATH="$shim:/usr/bin:/bin" preflight_check_deps 2>&1)"; then
