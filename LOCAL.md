@@ -57,6 +57,35 @@ Check mode: `update-herdr --check` runs `just check` instead of installing.
   lists the conflicted files; resolve manually, then `git rebase --continue`.
 - Force pushes always use `--force-with-lease`.
 
+## Version reporting
+
+Fork builds report `herdr <upstream-version>+tabbycwd.<short-sha>`:
+
+- `<upstream-version>` follows upstream's `Cargo.toml` version automatically;
+  it is never hand-edited in this fork.
+- `tabbycwd` is the fixed build channel for this fork.
+- `<short-sha>` is the current `local/tabby-cwd` HEAD short SHA, injected at
+  build time.
+
+It reuses Herdr's existing build metadata mechanism: `update-herdr` builds with
+
+    HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$(git rev-parse --short HEAD)" cargo build --release
+
+so `herdr --version` always shows the exact commit being run. Stable and
+preview channel output is unchanged.
+
+## `herdr update` guard
+
+The installed `~/.local/bin/herdr` is a fork build and must not be replaced by
+the official updater. `~/.bashrc` defines a `herdr` shell function that blocks
+`herdr update`, prints
+
+    Custom Herdr build detected.
+    Use: update-herdr
+
+and exits non-zero. All other invocations (`herdr`, `herdr agent ...`,
+`herdr server ...`, `herdr --version`) call the real binary via `command herdr`.
+
 ## Why not `herdr update`
 
 `herdr update` replaces the installed binary from the official channel and
