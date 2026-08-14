@@ -305,6 +305,10 @@ pub struct HeadlessServer {
     /// when the title itself has not changed, without every code path that
     /// changes the foreground client having to remember to invalidate this.
     sent_window_title: Option<(u64, Option<String>)>,
+    /// Focused pane cwd last pushed as `OSC 1337;CurrentDir=...`, paired with
+    /// the client that received it. Deduplicates per client so a background
+    /// pane's cwd report never re-sends an unchanged focused cwd.
+    sent_terminal_cwd: Option<(u64, String)>,
     /// Window title set through `client.window_title.set`. While present it wins
     /// over the configured `ui.window_title` until the API clears it again.
     api_window_title: Option<String>,
@@ -512,6 +516,7 @@ impl HeadlessServer {
             next_client_id: 1,
             foreground_client_id: None,
             sent_window_title: None,
+            sent_terminal_cwd: None,
             api_window_title: None,
             server_keybindings,
             server_config_diagnostic,
@@ -720,6 +725,7 @@ impl HeadlessServer {
                     needs_full_render = true;
                     crate::render_prof::event("full_render_cause.terminal_title_sidebar");
                 }
+                self.sync_focused_pane_cwd();
                 if needs_full_render && !outer_title_synced {
                     self.sync_window_title();
                 }
@@ -2233,6 +2239,45 @@ impl HeadlessServer {
             },
         );
         self.sent_window_title = sent.then_some((client_id, title));
+        sent
+    }
+
+    /// Pushes the focused pane's current cwd as `OSC 1337;CurrentDir=...` when
+    /// it differs from what the foreground client last received. Runs alongside
+    /// every render, so a focused-pane cwd report and a pane focus change both
+    /// land here; background panes never produce a send because the focused
+    /// pane's cwd is unchanged. A newly attached client has an empty cache and
+    /// is written to immediately.
+    fn sync_focused_pane_cwd(&mut self) {
+        let Some(cwd) = self.app.focused_pane_cwd() else {
+            return;
+        };
+        let cwd = cwd.display().to_string();
+        if let Some((sent_client_id, sent_cwd)) = self.sent_terminal_cwd.as_ref() {
+            if self.foreground_client_id == Some(*sent_client_id) && *sent_cwd == cwd {
+                return;
+            }
+        }
+        self.send_terminal_cwd(cwd);
+    }
+
+    /// Sends the focused pane cwd and remembers it only when a foreground
+    /// client took it, mirroring `send_window_title`'s attach semantics.
+    fn send_terminal_cwd(&mut self, cwd: String) -> bool {
+        let Some(client_id) = self.foreground_client_id else {
+            self.sent_terminal_cwd = None;
+            return false;
+        };
+        if self
+            .clients
+            .get(&client_id)
+            .is_none_or(|client| client.writer.is_none())
+        {
+            self.sent_terminal_cwd = None;
+            return false;
+        }
+        let sent = self.send_to_client(client_id, ServerMessage::TerminalCwd { cwd: cwd.clone() });
+        self.sent_terminal_cwd = sent.then_some((client_id, cwd));
         sent
     }
 
@@ -5333,6 +5378,7 @@ mod tests {
             next_client_id: 1,
             foreground_client_id: None,
             sent_window_title: None,
+            sent_terminal_cwd: None,
             api_window_title: None,
             server_keybindings,
             server_config_diagnostic: None,
@@ -10473,6 +10519,78 @@ next_tab = ""
                 .is_err(),
             "bells without a foreground client must not be retained"
         );
+    }
+
+    #[test]
+    fn focused_pane_cwd_sync_sends_osc_1337_only_on_change() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        server.app.state.ensure_test_terminals();
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("focused terminal")
+            .cwd = std::path::PathBuf::from("/repo/alpha");
+
+        server.sync_focused_pane_cwd();
+        match read_server_message(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("focused pane cwd message"),
+        ) {
+            ServerMessage::TerminalCwd { cwd } => assert_eq!(cwd, "/repo/alpha"),
+            other => panic!("expected TerminalCwd, got {other:?}"),
+        }
+
+        // Unchanged focused cwd must not re-send.
+        server.sync_focused_pane_cwd();
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "unchanged focused cwd must not re-send"
+        );
+
+        // A change re-sends (covers the focus-change resend path).
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("focused terminal")
+            .cwd = std::path::PathBuf::from("/repo/beta");
+        server.sync_focused_pane_cwd();
+        match read_server_message(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("updated focused pane cwd message"),
+        ) {
+            ServerMessage::TerminalCwd { cwd } => assert_eq!(cwd, "/repo/beta"),
+            other => panic!("expected TerminalCwd, got {other:?}"),
+        }
     }
 
     #[test]

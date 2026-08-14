@@ -741,6 +741,15 @@ pub enum ServerMessage {
         count: u16,
     },
 
+    /// Forward the focused pane's working directory to the host terminal as
+    /// `OSC 1337;CurrentDir=...`. Sent only when the reported pane is focused
+    /// or when pane focus moves to a pane with a known cwd. The client writes
+    /// the path verbatim: Tabby consumes `CurrentDir` without percent-decoding.
+    TerminalCwd {
+        /// Absolute path of the focused pane.
+        cwd: String,
+    },
+
     /// One validated Herdr-owned Kitty regular-file RGBA transmission.
     GraphicsFile {
         path: String,
@@ -1641,6 +1650,17 @@ mod tests {
     #[test]
     fn server_terminal_bell_roundtrip() {
         let msg = ServerMessage::TerminalBell { count: 3 };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_terminal_cwd_roundtrip() {
+        let msg = ServerMessage::TerminalCwd {
+            cwd: "/home/user/repo".to_string(),
+        };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();

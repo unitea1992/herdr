@@ -1723,6 +1723,14 @@ async fn run_client_loop(
                         warn!(err = %err, "failed to emit terminal bell");
                     }
                 }
+                ServerMessage::TerminalCwd { cwd } => {
+                    if let Err(err) = crate::terminal_effects::write_current_dir(
+                        &mut io::stdout(),
+                        std::path::Path::new(&cwd),
+                    ) {
+                        warn!(err = %err, "failed to write terminal cwd");
+                    }
+                }
                 ServerMessage::GraphicsFile {
                     path,
                     expected_len,

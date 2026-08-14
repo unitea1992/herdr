@@ -920,6 +920,19 @@ impl App {
         changed
     }
 
+    /// The focused pane's known working directory, using the same detection
+    /// chain as `cwd_for_pane`: the live OSC 7 report first, then the process
+    /// cwd. `None` when no pane is focused or nothing is known yet.
+    pub(crate) fn focused_pane_cwd(&self) -> Option<std::path::PathBuf> {
+        let ws_idx = self.state.active?;
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let pane_id = ws.focused_pane_id()?;
+        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
+        ws.tabs
+            .get(tab_idx)?
+            .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_prefix_input_source(
         &mut self,
@@ -936,6 +949,7 @@ impl App {
 
         let mut needs_render = true;
         let mut sent_window_title: Option<Option<String>> = None;
+        let mut sent_cwd: Option<std::path::PathBuf> = None;
         let mut host_mouse_capture_active = self.state.mouse_capture;
         let mut host_keyboard_report_all_active = false;
 
@@ -1077,6 +1091,12 @@ impl App {
                             title.as_deref(),
                         )?;
                         sent_window_title = Some(title);
+                    }
+                }
+                if let Some(cwd) = self.focused_pane_cwd() {
+                    if sent_cwd.as_ref() != Some(&cwd) {
+                        crate::terminal_effects::write_current_dir(&mut std::io::stdout(), &cwd)?;
+                        sent_cwd = Some(cwd);
                     }
                 }
                 let _sync_output = SyncOutputGuard::begin()?;
