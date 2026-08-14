@@ -69,5 +69,6 @@ jobs:
 
       - name: Push fork branch
         if: steps.detect.outputs.update == 'true'
-        shell: bash
-        run: git push origin HEAD:local/tabby-cwd
+        # Force-with-lease: the rebase rewrites commit SHAs, so a plain push is
+        # a non-fast-forward. Lease still fails if the remote moved meanwhile.
+        run: git push --force-with-lease origin HEAD:local/tabby-cwd
