@@ -113,9 +113,11 @@ run_checks() {
     fi
     local head_sha
     head_sha="$(git rev-parse --short HEAD)"
-    export HERDR_BUILD_CHANNEL=tabbycwd
-    export HERDR_BUILD_ID="$head_sha"
 
+    # fmt/clippy/nextest run on the stable channel: the test suite asserts
+    # env!("CARGO_PKG_VERSION") (e.g. tests/api_ping.rs), so custom version
+    # metadata is applied only to the release build below, matching how the
+    # artifact is produced.
     echo "== cargo fmt --check =="
     cargo fmt --check
     echo "== cargo clippy --all-targets --locked -- -D warnings =="
@@ -126,8 +128,10 @@ run_checks() {
         --final-status-level slow \
         --failure-output final \
         --success-output never
-    echo "== cargo build --release --locked (no install) =="
-    cargo build --release --locked
+    echo "== cargo build --release --locked (channel=tabbycwd, id=$head_sha, no install) =="
+    HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$head_sha" cargo build --release --locked
+    echo "== built binary version =="
+    ./target/release/herdr --version
 }
 
 main() {
