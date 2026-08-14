@@ -81,7 +81,7 @@ ensure_rust() {
 
 ensure_binstall() {
     if command -v cargo-binstall >/dev/null 2>&1; then
-        say "cargo-binstall present: $(cargo-binstall --version)"
+        say "cargo-binstall present"
         return
     fi
     say "installing cargo-binstall (user space)"
@@ -93,7 +93,7 @@ ensure_binstall() {
 
 ensure_nextest() {
     if command -v cargo-nextest >/dev/null 2>&1; then
-        say "cargo-nextest present: $(cargo-nextest --version)"
+        say "cargo-nextest present"
         return
     fi
     say "installing cargo-nextest via cargo-binstall"
