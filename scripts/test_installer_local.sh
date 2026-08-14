@@ -122,6 +122,25 @@ count=$(grep -c '^herdr()' "$HOME/.bashrc" || true)
 [[ "$count" == "1" ]] || fail "user-defined herdr() duplicated"
 ok "existing user herdr() left untouched"
 
+# --- execution guard: source vs stdin vs direct -------------------------------
+# Regression: `curl ... | bash` runs the installer via stdin, where BASH_SOURCE[0]
+# is unbound and $0 is bash. Under `set -u` the old guard died with
+# "BASH_SOURCE[0]: unbound variable" before reaching main. HERDR_LOCAL_TEST=1
+# lets these run to the marked main() without any network or real-env changes.
+export HERDR_LOCAL_TEST=1
+out="$(cat "$INSTALLER" | bash 2>&1)" || fail "stdin-executed installer crashed"
+echo "$out" | grep -q 'main() reached (test)' || fail "installer run via stdin did not reach main()"
+unset HERDR_LOCAL_TEST
+ok "stdin (curl ... | bash) reaches main() under set -u"
+
+out="$(env HERDR_LOCAL_TEST=1 bash "$INSTALLER" 2>&1)" || fail "direct-executed installer crashed"
+echo "$out" | grep -q 'main() reached (test)' || fail "installer run as script did not reach main()"
+ok "bash install-tabbycwd.sh reaches main() under set -u"
+
+out="$(env HERDR_LOCAL_TEST=1 bash -c 'source "$1"' _ "$INSTALLER" 2>&1)" || fail "sourced installer crashed"
+echo "$out" | grep -q 'main() reached (test)' && fail "sourced installer ran main()"
+ok "source install-tabbycwd.sh does not invoke main()"
+
 # --- dirty repo is never touched ---------------------------------------------
 rm -f "$HOME/.bashrc"
 git init -q "$REPO"

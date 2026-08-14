@@ -243,6 +243,13 @@ verify() {
 }
 
 main() {
+    # Test-only short-circuit: lets the isolated test prove the guard reaches
+    # main() via stdin or direct execution without any network. Never set for
+    # real use.
+    if [[ "${HERDR_LOCAL_TEST:-}" == "1" ]]; then
+        echo "main() reached (test)"
+        return
+    fi
     require_linux
     require_commands
     ensure_bin_dir
@@ -270,6 +277,10 @@ main() {
     echo "update with: update-herdr   (or: update-herdr --check)"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# Executed paths: `bash install-tabbycwd.sh` (BASH_SOURCE[0] == $0) and
+# `curl ... | bash` / `cat ... | bash` (BASH_SOURCE[0] unbound under `set -u`,
+# empty with :-, $0 == bash). Sourced: BASH_SOURCE[0] is the file path, != $0,
+# so main is skipped. `:-` keeps this safe under `set -u`.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
     main "$@"
 fi
