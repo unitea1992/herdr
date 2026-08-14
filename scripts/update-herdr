@@ -4,17 +4,19 @@
 # truth; the installer copies it to $BIN_DIR/update-herdr.
 #
 # Usage: update-herdr [--check] [--clean]
-#   no flags  fetch upstream+origin, rebase local/tabby-cwd onto
-#             upstream/master, force-push the fork, build the release binary
-#             with custom version metadata, install it to $BIN_DIR/herdr.
-#   --check   same fetch/rebase/push, then run Linux-native checks (fmt,
-#             clippy, nextest, release build) WITHOUT installing anything.
+#   no flags  fetch origin, fast-forward local/tabby-cwd to
+#             origin/local/tabby-cwd, build the release binary with custom
+#             version metadata, install it to $BIN_DIR/herdr.
+#   --check   same follow, then run Linux-native checks (fmt, clippy, nextest,
+#             release build) WITHOUT installing anything.
 #   --clean   `cargo clean` before the build (use after repo moves when stale
 #             cache paths break the vendored zig build).
 #
 # This fork is Linux-only: never installs or runs Windows/macOS targets,
 # PowerShell tooling, or the official updater (`herdr update` is blocked by
-# the .bashrc wrapper). Checks never depend on `just`.
+# the .bashrc wrapper). Checks never depend on `just`. Machine updates only
+# fetch the fork (public, unauthenticated) and fast-forward; upstream rebase
+# and push happen on the developer machine.
 set -euo pipefail
 
 REPO="${HERDR_LOCAL_REPO:-$HOME/projects/herdr}"
@@ -76,6 +78,28 @@ resolve_zig() {
     echo "  Install/repair it with the one-line installer:" >&2
     echo "    curl -fsSL https://raw.githubusercontent.com/unitea1992/herdr/local/tabby-cwd/install-tabbycwd.sh | bash" >&2
     exit 1
+}
+
+# After `git fetch origin`, follow origin/$BRANCH fast-forward only: keep the
+# branch when it is already at or behind origin; refuse clearly when diverged
+# so local commits are never discarded silently.
+follow_origin() {
+    git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null 2>&1 \
+        || die "origin/$BRANCH not found after fetch (cannot update)"
+    local head remote
+    head="$(git rev-parse --short HEAD)"
+    remote="$(git rev-parse --short "origin/$BRANCH")"
+    if [[ "$head" == "$remote" ]]; then
+        echo "== already up to date with origin/$BRANCH =="
+        return
+    fi
+    if git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+        echo "== fast-forwarding $BRANCH to origin/$BRANCH =="
+        git merge --ff-only "origin/$BRANCH"
+        echo "== now at $(git rev-parse --short HEAD) =="
+        return
+    fi
+    die "local '$BRANCH' diverges from origin/$BRANCH; refusing to discard local commits (resolve manually or re-run from the developer machine)"
 }
 
 preflight_build_deps() {
@@ -154,30 +178,11 @@ main() {
         echo "error: expected branch '$BRANCH', currently on '$(git branch --show-current)'" >&2
         exit 1
     fi
-    git remote get-url upstream >/dev/null 2>&1 || die "remote 'upstream' missing (add: git remote add upstream https://github.com/herdrdev/herdr.git)"
     git remote get-url origin >/dev/null 2>&1 || die "remote 'origin' missing"
 
-    local upstream_before
-    upstream_before="$(git rev-parse --short upstream/master)"
-
-    echo "== fetch upstream + origin =="
-    git fetch upstream
+    echo "== fetch origin =="
     git fetch origin
-
-    local upstream_after
-    upstream_after="$(git rev-parse --short upstream/master)"
-
-    echo "== rebase $BRANCH onto upstream/master =="
-    if ! git rebase upstream/master; then
-        echo
-        echo "error: rebase conflicts; resolve manually, then run: git rebase --continue" >&2
-        echo "conflicted files:" >&2
-        git diff --name-only --diff-filter=U >&2
-        exit 1
-    fi
-
-    echo "== push $BRANCH to origin (--force-with-lease) =="
-    git push --force-with-lease origin "$BRANCH"
+    follow_origin
 
     if [[ "$check_mode" == 1 ]]; then
         run_checks
@@ -186,8 +191,6 @@ main() {
     fi
 
     echo
-    echo "Upstream before: $upstream_before"
-    echo "Upstream after:  $upstream_after"
     echo "Local HEAD:      $(git rev-parse --short HEAD)"
     echo
     if [[ "$check_mode" == 1 ]]; then

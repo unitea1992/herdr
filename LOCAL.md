@@ -73,20 +73,26 @@ marker でガードされ、二重に追記されることはありません。
 `update-herdr`(実体は `scripts/update-herdr`、`$BIN_DIR/update-herdr` として
 インストール):
 
+利用マシンはこのフォークを取得・ビルドするだけなので、更新フローから
+`upstream` の rebase と origin への push を取り除いています。upstream 追従・
+rebase・push は開発マシン側で行い、`origin/local/tabby-cwd` が常に配布用の
+最新状態です。更新は fast-forward のみなので、GitHub 認証(push に必要な
+認証)は一切要求しません。
+
 1. 事前チェック: 作業ツリーが clean、現在のブランチが `local/tabby-cwd`、
-   `origin`/`upstream` リモートが存在する場合以外は中止。
-2. `upstream` と `origin` を fetch する。
-3. `local/tabby-cwd` を `upstream/master` へ rebase する。
-4. 成功時のみ `--force-with-lease` で origin へ force-push する。
-5. `cargo build --release --locked` でビルドし、成功時のみ
+   `origin` リモートが存在する場合以外は中止。
+2. `origin` を fetch する(public なので認証不要)。
+3. `origin/local/tabby-cwd` へ fast-forward のみで追従する。既に最新なら
+   そのまま、origin が前に進んでいるなら ff、local が diverge している場合は
+   コミットを壊さずに明確なエラーで中止。
+4. `cargo build --release --locked` でビルドし、成功時のみ
    `target/release/herdr` を `$BIN_DIR/herdr` にインストールする。
-6. upstream の before/after とローカル HEAD を報告する。実行中の herdr
-   server を停止・再起動することはありません。都合の良いタイミングで
-   再起動してください。
+5. ローカル HEAD を報告する。実行中の herdr server を停止・再起動する
+   ことはありません。都合の良いタイミングで再起動してください。
 
 バリエーション:
 
-- `update-herdr --check` — 同じ fetch/rebase/push の後に、Linux ネイティブの
+- `update-herdr --check` — 同じ origin fetch/ff 追従の後に、Linux ネイティブの
   チェック(依存の事前確認、`cargo fmt --check`、`cargo clippy --all-targets
   --locked -- -D warnings`、`cargo nextest run --locked ...`、`cargo build
   --release --locked`)を**インストールなしで**実行します。
@@ -138,9 +144,10 @@ stable / preview チャネルの出力は変わりません。
 
 ## コンフリクト対応方針
 
-- rebase のコンフリクトは自動解決しません。`update-herdr` はコンフリクトで
-  停止し、競合ファイルを列挙します。手動で解決してから
-  `git rebase --continue` を実行してください。インストーラは rebase を
-  中止します(あくまで初期セットアップのみ。解決して `update-herdr` を
-  再実行してください)。
-- force-push は常に `--force-with-lease` を使用します。
+- 利用マシンの `update-herdr` では rebase を行いません。local が
+  `origin/local/tabby-cwd` と diverge した場合、自動的には何も壊さずに
+  明確なエラーで停止します。通常は開発マシン側の配布状態と rebase 済みの
+  追従状態をそのまま使います。ローカルの独自コミットが必要なら手動で
+  merge/rebase してください。
+- インストーラの初期セットアップだけは `upstream/master` への rebase を
+  試み、コンフリクト時は中断します(初期セットアップのみ)。

@@ -24,8 +24,10 @@ grep -q 'HERDR_LOCAL_REPO' "$INSTALLER" || fail "installer missing HERDR_LOCAL_R
 grep -q 'HERDR_LOCAL_BIN' "$INSTALLER" || fail "installer missing HERDR_LOCAL_BIN"
 grep -q '0.15.2' "$UPDATER" || fail "updater zig version not pinned to 0.15.2"
 grep -q '0.15.2' "$INSTALLER" || fail "installer zig version not pinned to 0.15.2"
-grep -q 'force-with-lease' "$UPDATER" || fail "updater missing --force-with-lease"
-ok "static checks"
+grep -qE 'force-with-lease|git push' "$UPDATER" && fail "update-herdr must not push (GitHub auth)"
+grep -qE 'git fetch upstream|upstream/master|force-with-lease' "$UPDATER" && fail "update-herdr must not reference upstream/rebase/push"
+grep -q 'follow_origin' "$UPDATER" || fail "update-herdr missing follow_origin fast-forward logic"
+ok "static checks (no push/upstream in update-herdr)"
 
 # --- isolated environment ---------------------------------------------------
 tmp="$(mktemp -d)"
@@ -242,6 +244,52 @@ ensure_branch
 [[ "$(git -C "$REPO" branch --show-current)" == "local/tabby-cwd" ]] || fail "branch not local/tabby-cwd"
 ensure_branch
 ok "branch checkout + idempotent re-run"
+
+# --- update-herdr follow-origin (fast-forward only, no push) -----------------
+# ensure_branch above cd'd into $REPO, so get back to a stable cwd before the
+# re-clone deletes it (a deleted cwd makes the next git clone fail).
+cd "$REPO_ROOT"
+# Fresh clone so origin still points at the local bare fork (path, no auth; a
+# real user machine likewise only fetches the public fork).
+rm -rf "$REPO"
+git clone -q "$tmp/fork.git" "$REPO"
+git -C "$REPO" checkout -q local/tabby-cwd
+
+# already up to date -> follow_origin succeeds, HEAD does not move.
+head_before="$(git -C "$REPO" rev-parse HEAD)"
+( cd "$REPO" && follow_origin ) >/dev/null
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_before" ]] || fail "follow_origin moved HEAD when already latest"
+ok "update: already latest -> proceeds, HEAD unchanged"
+
+# origin updated -> fast-forward follows, local commit kept.
+git -C "$tmp/seed" checkout -q local/tabby-cwd
+git -C "$tmp/seed" commit -q --allow-empty -m "origin advance"
+git -C "$tmp/seed" push -q origin local/tabby-cwd
+( cd "$REPO" && git fetch origin -q && follow_origin ) >/dev/null
+[[ "$(git -C "$REPO" rev-parse --short HEAD)" == "$(git -C "$REPO" rev-parse --short "origin/local/tabby-cwd")" ]] || fail "fast-forward did not follow origin"
+ok "update: origin ahead -> fast-forward follows origin"
+
+# diverged -> explicit refusal, local commit intact.
+git -C "$REPO" commit -q --allow-empty -m "local diverge"
+head_diverge="$(git -C "$REPO" rev-parse HEAD)"
+if out="$(cd "$REPO" && follow_origin 2>&1)"; then
+    fail "follow_origin accepted a diverged branch"
+fi
+echo "$out" | grep -qi diverge || fail "diverged error lacks the word diverge"
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_diverge" ]] || fail "diverged branch lost its local commit"
+ok "update: diverged -> explicit error, no destruction"
+
+# dirty tree -> update-herdr stops before fetch/build (exit 1, no push).
+rm -rf "$REPO"; git init -q "$REPO"
+git -C "$REPO" remote add origin "https://github.com/unitea1992/herdr.git"
+git -C "$REPO" checkout -q -b local/tabby-cwd
+printf 'user file\n' > "$REPO/user.txt"
+if out="$(bash "$UPDATER" 2>&1)"; then
+    fail "update-herdr accepted a dirty tree"
+fi
+echo "$out" | grep -q 'dirty' || fail "dirty message missing"
+[[ -f "$REPO/user.txt" ]] || fail "dirty file was destroyed"
+ok "update: dirty tree rejected before any fetch/build"
 
 # --- version format ------------------------------------------------------------
 up="$(check_version_format "herdr 0.8.0+tabbycwd.abcdef12" "abcdef12")" || fail "valid version rejected"
