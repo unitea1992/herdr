@@ -29,6 +29,28 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "required command '$cmd' is not on PATH"
 }
 
+# Latest full commit SHA of $BRANCH on $FORK_URL via a lightweight
+# ls-remote only. Dies on network failure without touching the installed
+# binary or attempting a clone/build.
+remote_head_sha() {
+    local ls sha
+    ls="$(git ls-remote "$FORK_URL" "refs/heads/$BRANCH")" \
+        || die "could not reach $FORK_URL (git ls-remote failed); installed herdr left untouched"
+    sha="$(cut -f1 <<<"$ls")"
+    if [[ -z "$sha" ]]; then
+        die "no ref $BRANCH on $FORK_URL; installed herdr left untouched"
+    fi
+    echo "$sha"
+}
+
+# Short build SHA from `herdr --version` (`<ver>+tabbycwd.<sha>`). Non-zero
+# exit and empty output mean the installed binary is not a tabbycwd build.
+installed_sha() {
+    local out
+    out="$("$BINARY" --version 2>/dev/null)" || return 1
+    [[ "$out" =~ \+tabbycwd\.([0-9a-f]+) ]] && echo "${BASH_REMATCH[1]}"
+}
+
 # Resolve zig 0.15.2 as a complete installation (zig binary + lib/ + docs
 # tree), the layout the installer keeps under $ZIG_ROOT/. Resolution: the
 # herdr-managed complete tree first, then an exact-version PATH zig whose real
@@ -87,6 +109,19 @@ build_release() {
 
 main() {
     require_cmd git
+    local remote installed
+    remote="$(remote_head_sha)"
+    if installed="$(installed_sha)"; then
+        # Installed reports a short SHA, remote a full one; a full SHA always
+        # starts with its short abbreviation. Match on prefix.
+        if [[ "$remote" == "$installed"* ]]; then
+            echo "herdr is already up to date ($installed)"
+            exit 0
+        fi
+        echo "== installed $installed, remote $remote — building =="
+    else
+        echo "== no tabbycwd build info on installed herdr — building =="
+    fi
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT
     clone_fork

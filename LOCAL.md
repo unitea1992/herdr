@@ -85,11 +85,27 @@ Zig 0.15.2 の完全ツリーが無い場合だけ用意し、フォークを `l
 
 source repo の永続 checkout(`$HOME/projects/herdr` など)は作りません。
 
+## upstream 追従(GitHub Actions)
+
+`.github/workflows/upstream-sync.yml` が `herdrdev/herdr` の `master` への追従
+を週1回程度の schedule と手動(`workflow_dispatch`)で自動実行します。
+`local/tabby-cwd` が upstream の新 commit をまだ取り込んでいない場合のみ
+rebase → Zig 0.15.2 準備 → `cargo build --release --locked` を実行し、build
+成功時のみ `origin/local/tabby-cwd` へ push します。更新が無ければ git での
+確認だけして即終了します(rebase / build は一切実行しません)。rebase
+conflict や build failure は GitHub Actions の failed run として確認します。
+
+各利用マシンでは何もせず `update-herdr` を実行するだけです。すでに最新版
+なら remote SHA 確認だけで終了し、clone / build しません。
+
 ## 更新フロー
 
 `update-herdr`(実体は `scripts/update-herdr`、`$BIN_DIR/update-herdr` として
 インストール)は毎回:
 
+0. `git ls-remote` で `origin/local/tabby-cwd` の HEAD SHA を取得し、
+   installed `herdr --version` の `+tabbycwd.<sha>` と比較。一致すれば
+   `herdr is already up to date (<sha>)` と表示して即終了。
 1. 依存(cargo / rustc / Zig 完全ツリー)を事前確認。
 2. `mktemp -d` の一時ディレクトリへ `local/tabby-cwd` を `--depth=1` で
    shallow clone。
@@ -98,6 +114,10 @@ source repo の永続 checkout(`$HOME/projects/herdr` など)は作りません�
 5. 成功時のみ installed `herdr` を置換し、clone 内の最新
    `scripts/update-herdr` を `$BIN_DIR/update-herdr` へ再配置(self-update)。
 6. version 表示、一時 clone を削除。
+
+installed binary が無い / `--version` が失敗 / SHA 形式を解析できない等、
+SHA 判定できない場合は通常の update フローへ進みます。`git ls-remote` が失敗
+した場合はエラーを表示して停止し、installed binary には触れません。
 
 `fetch` / rebase / push / upstream 操作は利用マシンでは行いません
 (GitHub 認証不要)。実行中の herdr server は停止・再起動しません。都合の

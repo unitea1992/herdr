@@ -1,0 +1,73 @@
+name: sync fork with upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # weekly, Monday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: local/tabby-cwd
+          fetch-depth: 0
+
+      - name: Check for upstream updates
+        id: detect
+        shell: bash
+        # Lightweight git-only check. Nothing runs past this step when
+        # upstream/master is already contained in the fork HEAD.
+        run: |
+          git fetch https://github.com/herdrdev/herdr.git master:refs/remotes/upstream/master
+          UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          echo "upstream: $UPSTREAM_SHA"
+          echo "fork:     $(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "no upstream updates; nothing to do"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "update=true" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase fork onto upstream master
+        if: steps.detect.outputs.update == 'true'
+        shell: bash
+        # On conflict git rebase fails the job; origin is untouched because
+        # the push step never runs. No auto-resolution.
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@users.noreply.github.com"
+          git rebase refs/remotes/upstream/master
+
+      - name: Install Zig 0.15.2
+        if: steps.detect.outputs.update == 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Build release
+        if: steps.detect.outputs.update == 'true'
+        shell: bash
+        # Explicit complete 0.15.2 tree (zig + lib/), matching the fork's
+        # resolution rules in scripts/update-herdr.
+        run: |
+          ZIG="$(readlink -f "$(command -v zig)")"
+          export ZIG
+          "$ZIG" version
+          cargo build --release --locked
+
+      - name: Push fork branch
+        if: steps.detect.outputs.update == 'true'
+        shell: bash
+        run: git push origin HEAD:local/tabby-cwd
