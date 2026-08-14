@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Local tests for the personal fork installer/updater. Runs against an
-# isolated HOME (fake tools, fake repos); never touches the real repo,
-# ~/.bashrc, or the network. Run with: bash scripts/test_installer_local.sh
+# isolated HOME and a local bare git repo standing in for the public fork;
+# fakes cargo/rust/zig so nothing touches the real toolchain or network.
+# Run with: bash scripts/test_installer_local.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,7 +12,7 @@ UPDATER="$REPO_ROOT/scripts/update-herdr"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 
-# --- static checks ----------------------------------------------------------
+# --- static checks -----------------------------------------------------------
 for f in "$INSTALLER" "$UPDATER"; do
     grep -n '/home/helios' "$f" && fail "$f hardcodes /home/helios"
     grep -inE 'windows|msvc|powershell|darwin|macos' "$f" | grep -vE '^[0-9]+:#' && fail "$f references cross-platform tooling"
@@ -19,181 +20,188 @@ done
 ok "no /home/helios hardcode; no windows/macos/ps1 references"
 
 grep -q 'nextest run' "$UPDATER" || fail "update-herdr --check missing nextest"
-grep -vE '^#' "$UPDATER" | grep -q 'just' && fail "update-herdr depends on just (a stale apt just on PATH must be irrelevant)"
-grep -q 'HERDR_LOCAL_REPO' "$INSTALLER" || fail "installer missing HERDR_LOCAL_REPO"
 grep -q 'HERDR_LOCAL_BIN' "$INSTALLER" || fail "installer missing HERDR_LOCAL_BIN"
-grep -q '0.15.2' "$UPDATER" || fail "updater zig version not pinned to 0.15.2"
-grep -q '0.15.2' "$INSTALLER" || fail "installer zig version not pinned to 0.15.2"
-grep -qE 'force-with-lease|git push' "$UPDATER" && fail "update-herdr must not push (GitHub auth)"
-grep -qE 'git fetch upstream|upstream/master|force-with-lease' "$UPDATER" && fail "update-herdr must not reference upstream/rebase/push"
-grep -q 'follow_origin' "$UPDATER" || fail "update-herdr missing follow_origin fast-forward logic"
-grep -qE 'git fetch upstream|git rebase|ensure_rebased|git push|force-with-lease' "$INSTALLER" && fail "installer must not fetch upstream/rebase/push"
-grep -q 'follow_origin' "$INSTALLER" || fail "installer missing follow_origin fast-forward logic"
-grep -qE 'install -Dm755 scripts/update-herdr' "$INSTALLER" || fail "installer must redeploy scripts/update-herdr to \$BIN_DIR"
-ok "static checks (no push/upstream in installer+updater)"
+grep -q '0.15.2' "$INSTALLER" || fail "installer zig not pinned to 0.15.2"
+grep -q '0.15.2' "$UPDATER" || fail "updater zig not pinned to 0.15.2"
 
-# --- isolated environment ---------------------------------------------------
+for f in "$INSTALLER" "$UPDATER"; do
+    grep -qE 'git push|force-with-lease' "$f" && fail "$f must not push (GitHub auth)"
+    grep -qE 'git rebase|git fetch|fetch upstream|remote.*upstream' "$f" && fail "$f must not fetch/rebase/upstream"
+    grep -q 'HERDR_LOCAL_REPO' "$f" && fail "$f must not reference HERDR_LOCAL_REPO (no persistent repo)"
+    grep -qE 'git clone --depth=1 --branch' "$f" || fail "$f must shallow-clone the branch"
+    grep -q 'local/tabby-cwd' "$f" || fail "$f missing branch local/tabby-cwd"
+    grep -q 'CARGO_TARGET_DIR' "$f" || fail "$f missing shared cargo target dir"
+    grep -q 'mktemp -d' "$f" || fail "$f missing throwaway temp dir"
+    grep -q 'trap.*EXIT' "$f" || fail "$f missing cleanup trap"
+done
+ok "no push/rebase/upstream/fetch/persistent-repo in installer+updater"
+
+grep -qE 'install -Dm755 .*update-herdr' "$INSTALLER" || fail "installer must deploy update-herdr"
+grep -qE 'install -Dm755 .*update-herdr' "$UPDATER" || fail "updater must self-update"
+grep -qE -- '--clean|clean_mode|cargo clean' "$UPDATER" && fail "update-herdr must not keep --clean"
+ok "installer deploys updater; updater self-updates; --clean removed"
+
+# --- isolated environment ----------------------------------------------------
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-export HOME="$tmp/home"
-mkdir -p "$HOME"
-export HERDR_LOCAL_REPO="$HOME/projects/herdr"
-export HERDR_LOCAL_BIN="$HOME/.local/bin"
 
-# source both scripts to test their functions (BASH_SOURCE guard skips main)
-source "$INSTALLER"
-source "$UPDATER"
-
-make_zig() { # $1=version $2=path; bare binary, no lib/ (old broken installer output)
-    mkdir -p "$(dirname "$2")"
-    printf '#!/bin/bash\nif [[ "${1:-}" == "version" ]]; then echo "%s"; fi\n' "$1" > "$2"
-    chmod +x "$2"
-}
-make_zig_tree() { # $1=version $2=bin-path; complete layout: zig + sibling lib/
-    make_zig "$1" "$2"
-    mkdir -p "$(dirname "$2")/lib"
-}
-
-# --- linux-only guard -------------------------------------------------------
 fakebin="$tmp/fakebin"
 mkdir -p "$fakebin"
-printf '#!/bin/bash\necho Darwin\n' > "$fakebin/uname"
-chmod +x "$fakebin/uname"
-if (PATH="$fakebin" require_linux) >/dev/null 2>&1; then
+
+cat > "$fakebin/cargo" <<'EOF'
+#!/bin/bash
+case "${1:-}" in
+    --version|fmt|clippy) exit 0 ;;
+    build)
+        if [[ "${FAKE_BUILD_FAIL:-0}" == "1" ]]; then
+            echo "error: fake build failure" >&2
+            exit 1
+        fi
+        sha="$(git rev-parse --short HEAD 2>/dev/null || echo deadbeef)"
+        mkdir -p "${CARGO_TARGET_DIR:-$HOME/.cache/herdr/target}/release"
+        printf '#!/bin/bash\necho "herdr 0.9.9+tabbycwd.%s"\n' "$sha" \
+            > "${CARGO_TARGET_DIR:-$HOME/.cache/herdr/target}/release/herdr"
+        chmod +x "${CARGO_TARGET_DIR:-$HOME/.cache/herdr/target}/release/herdr"
+        ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod +x "$fakebin/cargo"
+for c in rustc cargo-binstall cargo-nextest curl; do
+    printf '#!/bin/bash\nexit 0\n' > "$fakebin/$c"
+    chmod +x "$fakebin/$c"
+done
+
+# Local bare repo stands in for the public fork (same shallow-clone shape).
+fork="$tmp/fork.git"
+git init -q --bare "$fork"
+git -C "$fork" symbolic-ref HEAD refs/heads/local/tabby-cwd
+git clone -q "$fork" "$tmp/seed" 2>/dev/null
+git -C "$tmp/seed" config user.email t@t
+git -C "$tmp/seed" config user.name t
+mkdir -p "$tmp/seed/scripts"
+printf '#!/bin/bash\necho "fake update-herdr v1"\n' > "$tmp/seed/scripts/update-herdr"
+chmod +x "$tmp/seed/scripts/update-herdr"
+git -C "$tmp/seed" add -A
+git -C "$tmp/seed" commit -q -m seed
+git -C "$tmp/seed" push -q origin local/tabby-cwd
+sha1="$(git -C "$tmp/seed" rev-parse --short HEAD)"
+
+# Integration HOME: throwaway clones go under $work (via TMPDIR); the managed
+# zig complete tree is pre-created so no download happens.
+home="$tmp/home"
+mkdir -p "$home"
+work="$tmp/work"
+mkdir -p "$work"
+mkdir -p "$home/.local/share/herdr/zig-0.15.2/lib"
+printf '#!/bin/bash\n[[ "${1:-}" == version ]] && echo 0.15.2\nexit 0\n' \
+    > "$home/.local/share/herdr/zig-0.15.2/zig"
+chmod +x "$home/.local/share/herdr/zig-0.15.2/zig"
+
+# Run the full installer/updater main() in an isolated subshell, sourcing the
+# script so FORK_URL can point at the local bare repo (no network).
+run_installer() { # $1 = optional extra env (e.g. FAKE_BUILD_FAIL=1)
+    (
+        export HOME="$home" HERDR_LOCAL_BIN="$home/.local/bin" TMPDIR="$work"
+        export PATH="$fakebin:$PATH"
+        source "$INSTALLER"
+        FORK_URL="$fork"
+        [[ -n "${1:-}" ]] && export "$1"
+        main
+    )
+}
+run_updater() { # $@ = updater flags (e.g. --check); parsed by the sourced script
+    (
+        export HOME="$home" HERDR_LOCAL_BIN="$home/.local/bin" TMPDIR="$work"
+        export PATH="$fakebin:$PATH"
+        source "$UPDATER"
+        FORK_URL="$fork"
+        main
+    )
+}
+
+# Run the installer/updater and assert its exit status. The set +e / rc dance
+# is required: calling main() from an `if`/`||` condition suppresses `set -e`
+# inside the sourced script (which would swallow build failures). As a plain
+# statement, the sourced script's own `set -e` stays in force and a failure
+# propagates to $rc.
+expect_rc() { # $1 = expected 0/1, $2 = log file, $3.. = command to run
+    local want="$1" log="$2"; shift 2
+    set +e
+    "$@" >"$log" 2>&1
+    local rc=$?
+    set -e
+    [[ "$rc" == "$want" ]] || { cat "$log"; fail "expected exit $want, got $rc: $*"; }
+}
+
+# --- linux-only guard --------------------------------------------------------
+fb="$tmp/fakeuname"; mkdir -p "$fb"
+printf '#!/bin/bash\necho Darwin\n' > "$fb/uname"; chmod +x "$fb/uname"
+if ( export PATH="$fb"; source "$INSTALLER"; require_linux ) >/dev/null 2>&1; then
     fail "require_linux accepted a non-Linux uname"
 fi
 ok "require_linux rejects non-Linux"
 
-# --- zig: complete-tree layout (installer + updater) -------------------------
-# Resolution never depends on $HOME/.local/bin/zig, other PATH zigs are left
-# untouched, and the tarball fixture installs as a complete tree.
-ZIG_ROOT="$HOME/.local/share/herdr/zig-$ZIG_VERSION"
+# --- zig: complete-tree resolution (never a bare binary, never ~/.local/bin) --
+got="$( ( export HOME="$home"; source "$UPDATER"; resolve_zig ) )" || fail "resolve_zig failed"
+[[ "$got" == "$home/.local/share/herdr/zig-0.15.2/zig" ]] || fail "resolve_zig did not prefer managed tree (got: $got)"
 
-# A complete 0.15.2 on PATH is reused, nothing installed.
-zigpath="$tmp/zigpath"
-mkdir -p "$zigpath"
-make_zig_tree 0.15.2 "$zigpath/zig"
-got="$(PATH="$zigpath" resolve_zig)"
-[[ "$got" == "zig" ]] || fail "resolve_zig did not pick complete PATH zig (got: $got)"
-PATH="$zigpath" ensure_zig
-[[ "${ZIG_BIN:-}" == "zig" ]] || fail "ensure_zig did not set ZIG_BIN=zig"
-ok "complete zig 0.15.2 on PATH re-used"
+got="$( ( export HOME="$home"; source "$INSTALLER"; ensure_zig >/dev/null; echo "$ZIG" ) )" || fail "ensure_zig failed"
+[[ "$got" == "$home/.local/share/herdr/zig-0.15.2/zig" ]] || fail "ensure_zig did not pick managed tree (got: $got)"
 
-# Wrong-version PATH zig untouched; managed tree preferred (also covers the
-# old broken ~/.local/bin/zig from the previous installer layout).
-managedbin="$ZIG_ROOT/zig"
-make_zig_tree 0.15.2 "$managedbin"
-make_zig 0.14.0 "$zigpath/zig"
-make_zig 0.15.2 "$HOME/.local/bin/zig"   # old broken standalone, no lib/
-got="$(PATH="$zigpath" resolve_zig)"
-[[ "$got" == "$managedbin" ]] || fail "resolve_zig did not prefer managed tree (got: $got)"
-PATH="$zigpath" ensure_zig
-[[ "${ZIG_BIN:-}" == "$managedbin" ]] || fail "ensure_zig did not prefer managed tree"
-ok "managed complete tree preferred; PATH other-zig untouched"
-
-# Missing managed tree + bare old-standalone on PATH -> clean error, never
-# deletes the file (could be anyone's zig).
-rm -rf "$ZIG_ROOT"
-if out="$(PATH="$zigpath" resolve_zig 2>&1)"; then
-    fail "resolve_zig succeeded with no complete zig available"
+zh="$tmp/zighome"; mkdir -p "$zh/.local/bin"
+printf '#!/bin/bash\necho 0.15.2\n' > "$zh/.local/bin/zig"; chmod +x "$zh/.local/bin/zig"
+if out="$( ( export HOME="$zh" PATH="$zh/.local/bin:/usr/bin:/bin"; source "$UPDATER"; resolve_zig ) 2>&1 )"; then
+    fail "resolve_zig succeeded with only a bare ~/.local/bin/zig"
 fi
-echo "$out" | grep -q 'zig 0.15.2' || fail "missing zig error message"
-[[ -f "$HOME/.local/bin/zig" ]] || fail "old broken ~/.local/bin/zig was deleted"
-ok "no complete zig: errors, never uses/deletes ~/.local/bin/zig"
+echo "$out" | grep -q 'zig 0.15.2' || fail "missing-zig error message"
+[[ -f "$zh/.local/bin/zig" ]] || fail "bare ~/.local/bin/zig was deleted"
+ok "complete-tree zig resolution; bare ~/.local/bin/zig ignored and preserved"
 
-# Full install path: tarball fixture (zig + lib/) becomes the complete tree,
-# and installer re-run is idempotent. curl is stubbed to serve the fixture.
-if command -v xz >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
-    arch="$(uname -m)"
-    extracted="zig-$arch-linux-$ZIG_VERSION"
-    fixture_root="$tmp/fixture"
-    mkdir -p "$fixture_root/$extracted/lib"
-    printf '#!/bin/bash\nif [[ "${1:-}" == "version" ]]; then echo "%s"; fi\n' "$ZIG_VERSION" > "$fixture_root/$extracted/zig"
-    chmod +x "$fixture_root/$extracted/zig"
-    fixture_tarball="$tmp/zig.tar.xz"
-    (cd "$fixture_root" && tar -cJf "$fixture_tarball" "$extracted")
+# --- dependency preflight (updater) ------------------------------------------
+mkdir -p "$tmp/emptybin" "$tmp/shim"
+printf '#!/bin/bash\nexit 0\n' > "$tmp/shim/cargo"
+printf '#!/bin/bash\nexit 0\n' > "$tmp/shim/rustc"
+chmod +x "$tmp/shim/cargo" "$tmp/shim/rustc"
 
-    fakecurl="$tmp/fakecurl"
-    mkdir -p "$fakecurl"
-    printf '%s\n' \
-        '#!/bin/bash' \
-        '# fake curl: copy the fixture tarball to the -o target; URL irrelevant.' \
-        'prev=' \
-        'for arg in "$@"; do' \
-        '    if [[ "$prev" == "-o" ]]; then target="$arg"; fi' \
-        '    prev="$arg"' \
-        'done' \
-        'cp "$TEST_TARBALL" "$target"' \
-        > "$fakecurl/curl"
-    chmod +x "$fakecurl/curl"
-    export TEST_TARBALL="$fixture_tarball"
-
-    rm -f "$HOME/.local/bin/zig"   # clear the leftover from the case above
-    PATH="$fakecurl:/usr/bin:/bin" ensure_zig
-    [[ "${ZIG_BIN:-}" == "$ZIG_ROOT/zig" ]] || fail "ZIG_BIN not inside complete tree (got: ${ZIG_BIN:-})"
-    [[ -x "$ZIG_ROOT/zig" ]] || fail "managed zig binary missing after install"
-    [[ -d "$ZIG_ROOT/lib" ]] || fail "managed lib/ missing after install"
-    [[ ! -e "$HOME/.local/bin/zig" ]] || fail "installer must not touch ~/.local/bin"
-    ok "tarball fixture installed as complete tree (zig + lib/) at $ZIG_ROOT"
-
-    PATH="$fakecurl:/usr/bin:/bin" ensure_zig   # re-run
-    [[ "${ZIG_BIN:-}" == "$ZIG_ROOT/zig" ]] || fail "re-run changed ZIG_BIN"
-    [[ -x "$ZIG_ROOT/zig" && -d "$ZIG_ROOT/lib" ]] || fail "complete tree lost on re-run"
-    ok "installer re-run idempotent (complete tree kept)"
-else
-    ok "xz/tar absent — full-tree fixture test skipped"
+if out="$( ( export PATH="$tmp/emptybin"; export HOME="$home"; source "$UPDATER"; preflight_build_deps ) 2>&1 )"; then
+    fail "preflight_build_deps passed without cargo"
 fi
+echo "$out" | grep -q "required command 'cargo'" || fail "missing-cargo error"
+ok "missing cargo errors clearly"
 
-# --- dependency preflight (updater, report-only) -----------------------------
-shim="$tmp/shim"
-mkdir -p "$shim" "$tmp/emptybin"
-printf '#!/bin/bash\necho "cargo 1.85.0 (fake)"\n' > "$shim/cargo"
-printf '#!/bin/bash\necho "rustc 1.85.0 (fake)"\n' > "$shim/rustc"
-make_zig_tree 0.15.2 "$shim/zig"
-chmod +x "$shim/cargo" "$shim/rustc"
-
-if out="$(PATH="$shim:/usr/bin:/bin" preflight_check_deps 2>&1)"; then
+if out="$( ( export PATH="$tmp/shim:/usr/bin:/bin"; export HOME="$home"; source "$UPDATER"; preflight_check_deps ) 2>&1 )"; then
     fail "preflight_check_deps passed without cargo-nextest"
 fi
 echo "$out" | grep -q 'cargo-nextest' || fail "missing nextest error"
 echo "$out" | grep -q 'cargo binstall cargo-nextest --no-confirm' || fail "missing binstall hint"
 ok "missing cargo-nextest errors with binstall hint"
 
-if out="$(PATH="$tmp/emptybin" preflight_build_deps 2>&1)"; then
-    fail "preflight_build_deps passed without cargo"
-fi
-echo "$out" | grep -q "required command 'cargo'" || fail "missing cargo error"
-ok "missing cargo errors clearly"
-
 # --- .bashrc edits are marker-guarded and idempotent -------------------------
-( export PATH="/usr/bin:/bin"; ensure_bashrc_path; ensure_bashrc_path )
-count=$(grep -c 'herdr: local bin PATH' "$HOME/.bashrc" || true)
+bh="$tmp/bhome"; mkdir -p "$bh"
+( export HOME="$bh" PATH="/usr/bin:/bin"; source "$INSTALLER"; ensure_bashrc_path; ensure_bashrc_path )
+count=$(grep -c 'herdr: local bin PATH' "$bh/.bashrc" || true)
 [[ "$count" == "1" ]] || fail "PATH marker duplicated ($count)"
 ok ".bashrc PATH append idempotent"
 
-ensure_bashrc_guard
-ensure_bashrc_guard
-count=$(grep -c '^herdr()' "$HOME/.bashrc" || true)
+( export HOME="$bh" PATH="/usr/bin:/bin"; source "$INSTALLER"; ensure_bashrc_guard; ensure_bashrc_guard )
+count=$(grep -c '^herdr()' "$bh/.bashrc" || true)
 [[ "$count" == "1" ]] || fail "herdr() guard duplicated ($count)"
-grep -q 'Custom Herdr build detected' "$HOME/.bashrc" || fail "guard body missing"
-grep -q 'command herdr "\$@"' "$HOME/.bashrc" || fail "guard does not forward via command herdr"
+grep -q 'Custom Herdr build detected' "$bh/.bashrc" || fail "guard body missing"
+grep -q 'command herdr "\$@"' "$bh/.bashrc" || fail "guard does not forward via command herdr"
 ok ".bashrc herdr() guard appended exactly once"
 
-rm -f "$HOME/.bashrc"
-printf 'herdr() { echo user-defined; }\n' > "$HOME/.bashrc"
-ensure_bashrc_guard
-count=$(grep -c '^herdr()' "$HOME/.bashrc" || true)
+rm -f "$bh/.bashrc"
+printf 'herdr() { echo user-defined; }\n' > "$bh/.bashrc"
+( export HOME="$bh" PATH="/usr/bin:/bin"; source "$INSTALLER"; ensure_bashrc_guard )
+count=$(grep -c '^herdr()' "$bh/.bashrc" || true)
 [[ "$count" == "1" ]] || fail "user-defined herdr() duplicated"
 ok "existing user herdr() left untouched"
 
 # --- execution guard: source vs stdin vs direct -------------------------------
-# Regression: `curl ... | bash` runs the installer via stdin, where BASH_SOURCE[0]
-# is unbound and $0 is bash. Under `set -u` the old guard died with
-# "BASH_SOURCE[0]: unbound variable" before reaching main. HERDR_LOCAL_TEST=1
-# lets these run to the marked main() without any network or real-env changes.
 export HERDR_LOCAL_TEST=1
 out="$(cat "$INSTALLER" | bash 2>&1)" || fail "stdin-executed installer crashed"
-echo "$out" | grep -q 'main() reached (test)' || fail "installer run via stdin did not reach main()"
+echo "$out" | grep -q 'main() reached (test)' || fail "installer via stdin did not reach main()"
 unset HERDR_LOCAL_TEST
 ok "stdin (curl ... | bash) reaches main() under set -u"
 
@@ -205,155 +213,78 @@ out="$(env HERDR_LOCAL_TEST=1 bash -c 'source "$1"' _ "$INSTALLER" 2>&1)" || fai
 echo "$out" | grep -q 'main() reached (test)' && fail "sourced installer ran main()"
 ok "source install-tabbycwd.sh does not invoke main()"
 
-# --- dirty repo is never touched ---------------------------------------------
-rm -f "$HOME/.bashrc"
-git init -q "$REPO"
-echo "user change" > "$REPO/important.txt"
-if out="$(ensure_repo 2>&1)"; then
-    fail "ensure_repo accepted a dirty repo"
-fi
-echo "$out" | grep -q 'uncommitted changes' || fail "dirty-repo message missing"
-[[ -f "$REPO/important.txt" ]] || fail "dirty file was deleted"
-[[ "$(cat "$REPO/important.txt")" == "user change" ]] || fail "dirty file content changed"
-ok "dirty repo refused and preserved"
-
-rm -rf "$REPO"
-mkdir -p "$REPO"
-if out="$(ensure_repo 2>&1)"; then
-    fail "ensure_repo accepted a non-git directory"
-fi
-echo "$out" | grep -q 'not a git repository' || fail "non-git message missing"
-ok "non-git directory refused"
-
-# --- remotes + branch setup ---------------------------------------------------
-rm -rf "$REPO"
-git init -q --bare "$tmp/fork.git"
-git -C "$tmp/fork.git" symbolic-ref HEAD refs/heads/master
-git clone -q "$tmp/fork.git" "$tmp/seed"
-git -C "$tmp/seed" config user.email t@t
-git -C "$tmp/seed" config user.name t
-git -C "$tmp/seed" commit -q --allow-empty -m base
-git -C "$tmp/seed" push -q origin master
-git -C "$tmp/seed" checkout -q -b local/tabby-cwd
-git -C "$tmp/seed" commit -q --allow-empty -m patch
-git -C "$tmp/seed" push -q origin local/tabby-cwd
-git clone -q "$tmp/fork.git" "$REPO"
-( ensure_remotes )
-[[ "$(git -C "$REPO" remote get-url origin)" == "https://github.com/unitea1992/herdr.git" ]] || fail "origin not fork URL"
-if git -C "$REPO" remote get-url upstream >/dev/null 2>&1; then
-    fail "installer created unnecessary upstream remote"
-fi
-ok "install: origin=fork URL, upstream not created"
-
-# An existing upstream remote is left untouched (still useful on a dev machine).
-git -C "$REPO" remote add upstream "https://github.com/herdrdev/herdr.git"
-( ensure_remotes )
-[[ "$(git -C "$REPO" remote get-url upstream)" == "https://github.com/herdrdev/herdr.git" ]] || fail "existing upstream remote changed/deleted"
-ok "existing upstream remote left untouched"
-
-ensure_branch
-[[ "$(git -C "$REPO" branch --show-current)" == "local/tabby-cwd" ]] || fail "branch not local/tabby-cwd"
-ensure_branch
-ok "branch checkout + idempotent re-run"
-
-# --- update-herdr follow-origin (fast-forward only, no push) -----------------
-# ensure_branch above cd'd into $REPO, so get back to a stable cwd before the
-# re-clone deletes it (a deleted cwd makes the next git clone fail).
-cd "$REPO_ROOT"
-# Fresh clone so origin still points at the local bare fork (path, no auth; a
-# real user machine likewise only fetches the public fork).
-rm -rf "$REPO"
-git clone -q "$tmp/fork.git" "$REPO"
-git -C "$REPO" checkout -q local/tabby-cwd
-
-# already up to date -> follow_origin succeeds, HEAD does not move.
-head_before="$(git -C "$REPO" rev-parse HEAD)"
-( cd "$REPO" && follow_origin ) >/dev/null
-[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_before" ]] || fail "follow_origin moved HEAD when already latest"
-ok "update: already latest -> proceeds, HEAD unchanged"
-
-# origin updated -> fast-forward follows, local commit kept.
-git -C "$tmp/seed" checkout -q local/tabby-cwd
-git -C "$tmp/seed" commit -q --allow-empty -m "origin advance"
-git -C "$tmp/seed" push -q origin local/tabby-cwd
-( cd "$REPO" && git fetch origin -q && follow_origin ) >/dev/null
-[[ "$(git -C "$REPO" rev-parse --short HEAD)" == "$(git -C "$REPO" rev-parse --short "origin/local/tabby-cwd")" ]] || fail "fast-forward did not follow origin"
-ok "update: origin ahead -> fast-forward follows origin"
-
-# diverged -> explicit refusal, local commit intact.
-git -C "$REPO" commit -q --allow-empty -m "local diverge"
-head_diverge="$(git -C "$REPO" rev-parse HEAD)"
-if out="$(cd "$REPO" && follow_origin 2>&1)"; then
-    fail "follow_origin accepted a diverged branch"
-fi
-echo "$out" | grep -qi diverge || fail "diverged error lacks the word diverge"
-[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_diverge" ]] || fail "diverged branch lost its local commit"
-ok "update: diverged -> explicit error, no destruction"
-
-# dirty tree -> update-herdr stops before fetch/build (exit 1, no push).
-rm -rf "$REPO"; git init -q "$REPO"
-git -C "$REPO" remote add origin "https://github.com/unitea1992/herdr.git"
-git -C "$REPO" checkout -q -b local/tabby-cwd
-printf 'user file\n' > "$REPO/user.txt"
-if out="$(bash "$UPDATER" 2>&1)"; then
-    fail "update-herdr accepted a dirty tree"
-fi
-echo "$out" | grep -q 'dirty' || fail "dirty message missing"
-[[ -f "$REPO/user.txt" ]] || fail "dirty file was destroyed"
-ok "update: dirty tree rejected before any fetch/build"
-
-# --- installer origin-follow (same model as update-herdr) ----------------------
-cd "$REPO_ROOT"
-# Fresh clone = first install; repo already tracks origin/local/tabby-cwd.
-rm -rf "$REPO"
-git clone -q "$tmp/fork.git" "$REPO"
-git -C "$REPO" checkout -q local/tabby-cwd
-( cd "$REPO" && git fetch origin -q && ensure_branch && follow_origin ) >/dev/null
-[[ "$(git -C "$REPO" rev-parse --short HEAD)" == "$(git -C "$REPO" rev-parse --short origin/local/tabby-cwd)" ]] || fail "fresh clone not on origin/local/tabby-cwd"
-ok "install: fresh clone tracks origin/local/tabby-cwd"
-
-FORK_URL="$tmp/fork.git"   # keep ensure_remotes' origin off the real network
-install_flow() { cd "$REPO" && ensure_repo && ensure_remotes && git fetch origin -q && ensure_branch && follow_origin; }
-
-# origin updated -> installer re-run fast-forwards.
-git -C "$tmp/seed" checkout -q local/tabby-cwd
-git -C "$tmp/seed" commit -q --allow-empty -m "installer ff"
-git -C "$tmp/seed" push -q origin local/tabby-cwd
-( install_flow ) >/dev/null
-[[ "$(git -C "$REPO" rev-parse --short HEAD)" == "$(git -C "$REPO" rev-parse --short origin/local/tabby-cwd)" ]] || fail "installer re-run did not fast-forward"
-[[ "$(git -C "$REPO" remote get-url origin)" == "$FORK_URL" ]] || fail "ensure_remotes did not point origin at fork URL"
-ok "install: existing repo behind -> installer re-run fast-forwards"
-
-# Up to date now.
-head_before="$(git -C "$REPO" rev-parse HEAD)"
-( install_flow ) >/dev/null
-[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_before" ]] || fail "installer re-run moved HEAD when already latest"
-ok "install: already latest -> proceeds, HEAD unchanged"
-
-# diverged -> installer refuses without destroying local commits.
-git -C "$tmp/seed" checkout -q local/tabby-cwd
-git -C "$tmp/seed" commit -q --allow-empty -m "origin diverge"
-git -C "$tmp/seed" push -q origin local/tabby-cwd
-( cd "$REPO" && git fetch origin -q )
-git -C "$REPO" commit -q --allow-empty -m "local diverge"
-head_diverge="$(git -C "$REPO" rev-parse HEAD)"
-if out="$(install_flow 2>&1)"; then
-    fail "installer accepted a diverged branch"
-fi
-echo "$out" | grep -qi diverge || fail "installer diverged error lacks the word diverge"
-[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_diverge" ]] || fail "installer diverge path lost local commit"
-ok "install: diverged -> explicit error, no destruction"
-
 # --- version format ------------------------------------------------------------
-up="$(check_version_format "herdr 0.8.0+tabbycwd.abcdef12" "abcdef12")" || fail "valid version rejected"
+up="$( ( source "$INSTALLER"; check_version_format "herdr 0.8.0+tabbycwd.abcdef12" "abcdef12" ) )" || fail "valid version rejected"
 [[ "$up" == "0.8.0" ]] || fail "upstream version parse wrong (got: $up)"
-if check_version_format "herdr 0.8.0+tabbycwd.1234567" "abcdef12" >/dev/null; then
+if ( source "$INSTALLER"; check_version_format "herdr 0.8.0+tabbycwd.1234567" "abcdef12" ) >/dev/null; then
     fail "sha mismatch accepted"
 fi
-if check_version_format "herdr 0.8.0" "abcdef12" >/dev/null; then
+if ( source "$INSTALLER"; check_version_format "herdr 0.8.0" "abcdef12" ) >/dev/null; then
     fail "version without +tabbycwd metadata accepted"
 fi
 ok "version format (herdr <ver>+tabbycwd.<sha>) checks"
+
+# --- installer integration: fresh install ------------------------------------
+expect_rc 0 "$tmp/install.log" run_installer
+[[ -x "$home/.local/bin/herdr" ]] || fail "herdr binary not installed"
+ver="$("$home/.local/bin/herdr" --version)"
+[[ "$ver" == "herdr 0.9.9+tabbycwd.$sha1" ]] || fail "wrong version (got: $ver, want sha $sha1)"
+[[ -f "$home/.local/bin/update-herdr" ]] || fail "update-herdr not installed"
+grep -q 'fake update-herdr v1' "$home/.local/bin/update-herdr" || fail "installed update-herdr wrong content"
+[[ ! -e "$home/projects/herdr" ]] || fail "installer created a persistent repo"
+[[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "throwaway clone not cleaned up"
+[[ $(grep -c 'herdr: local bin PATH' "$home/.bashrc" || true) == "1" ]] || fail "PATH marker duplicated"
+[[ $(grep -c '^herdr()' "$home/.bashrc" || true) == "1" ]] || fail "guard duplicated"
+ok "installer: build+install, no persistent repo, clone cleaned, version verified"
+
+# --- installer re-run idempotent ----------------------------------------------
+expect_rc 0 "$tmp/install2.log" run_installer
+[[ -x "$home/.local/bin/herdr" ]] || fail "binary lost on re-run"
+[[ $(grep -c 'herdr: local bin PATH' "$home/.bashrc" || true) == "1" ]] || fail "PATH marker duplicated on re-run"
+[[ $(grep -c '^herdr()' "$home/.bashrc" || true) == "1" ]] || fail "guard duplicated on re-run"
+ok "installer re-run idempotent"
+
+# --- installer build failure: no clobber, cleanup, cache cleared --------------
+before="$(cat "$home/.local/bin/herdr")"
+expect_rc 1 "$tmp/fail.log" run_installer FAKE_BUILD_FAIL=1
+[[ "$(cat "$home/.local/bin/herdr")" == "$before" ]] || fail "failed build clobbered installed binary"
+[[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "throwaway clone not cleaned up after failure"
+[[ ! -e "$home/.cache/herdr/target" ]] || fail "cache not cleared by retry after failure"
+ok "installer build failure: binary preserved, clone cleaned, cache cleared"
+
+# --- updater: normal run updates herdr + self-updates -------------------------
+printf '#!/bin/bash\necho "fake update-herdr v2"\n' > "$tmp/seed/scripts/update-herdr"
+git -C "$tmp/seed" add -A
+git -C "$tmp/seed" commit -q -m advance
+git -C "$tmp/seed" push -q origin local/tabby-cwd
+sha2="$(git -C "$tmp/seed" rev-parse --short HEAD)"
+
+printf '#!/bin/bash\necho "stale herdr"\n' > "$home/.local/bin/herdr"
+printf '#!/bin/bash\necho "stale updater"\n' > "$home/.local/bin/update-herdr"
+chmod +x "$home/.local/bin/herdr" "$home/.local/bin/update-herdr"
+
+expect_rc 0 "$tmp/upd.log" run_updater
+[[ "$("$home/.local/bin/herdr" --version)" == "herdr 0.9.9+tabbycwd.$sha2" ]] || fail "updater did not update herdr (sha $sha2)"
+grep -q 'fake update-herdr v2' "$home/.local/bin/update-herdr" || fail "updater did not self-update"
+[[ ! -e "$home/projects/herdr" ]] || fail "updater created a persistent repo"
+[[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "updater throwaway clone not cleaned up"
+ok "updater: updates herdr + self-updates, no persistent repo, clone cleaned"
+
+# --- updater --check: installed binaries untouched ----------------------------
+before="$(cat "$home/.local/bin/herdr")"
+before_upd="$(cat "$home/.local/bin/update-herdr")"
+expect_rc 0 "$tmp/chk.log" run_updater --check
+[[ "$(cat "$home/.local/bin/herdr")" == "$before" ]] || fail "--check modified installed herdr"
+[[ "$(cat "$home/.local/bin/update-herdr")" == "$before_upd" ]] || fail "--check modified installed update-herdr"
+[[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "--check throwaway clone not cleaned up"
+ok "updater --check: installed binaries untouched, clone cleaned"
+
+# --- pre-existing ~/projects/herdr is never touched ---------------------------
+mkdir -p "$home/projects/herdr"
+echo "precious" > "$home/projects/herdr/keep.txt"
+expect_rc 0 "$tmp/install3.log" run_installer
+[[ "$(cat "$home/projects/herdr/keep.txt")" == "precious" ]] || fail "installer touched ~/projects/herdr"
+ok "pre-existing ~/projects/herdr left untouched"
 
 echo
 echo "all installer/updater tests passed"

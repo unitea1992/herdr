@@ -6,20 +6,24 @@
 #   curl -fsSL https://raw.githubusercontent.com/unitea1992/herdr/local/tabby-cwd/install-tabbycwd.sh | bash
 #
 # Overrides:
-#   HERDR_LOCAL_REPO  repo checkout path (default $HOME/projects/herdr)
 #   HERDR_LOCAL_BIN   binary dir (default $HOME/.local/bin)
 #
 # Linux-only. Installs Rust tooling (rustup, cargo-binstall, cargo-nextest)
 # and Zig 0.15.2 into user space only — no sudo, no system packages, no
-# Windows/macOS tooling. Never resets or deletes a dirty checkout. Safe to
-# re-run (marker-guarded .bashrc edits, no duplicates).
+# Windows/macOS tooling. Each run shallow-clones the fork into a throwaway
+# temp dir, builds, installs, and removes the clone; no persistent source
+# checkout is created. Rebuilds are shared through $HOME/.cache/herdr/target.
+# Safe to re-run (marker-guarded .bashrc edits, no duplicates, build failure
+# never overwrites an already-installed binary).
 set -euo pipefail
 
-REPO="${HERDR_LOCAL_REPO:-$HOME/projects/herdr}"
 BIN_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
 BRANCH="local/tabby-cwd"
 FORK_URL="https://github.com/unitea1992/herdr.git"
 ZIG_VERSION="0.15.2"
+ZIG_ROOT="$HOME/.local/share/herdr/zig-$ZIG_VERSION"
+CARGO_TARGET_DIR="$HOME/.cache/herdr/target"
+export CARGO_TARGET_DIR
 
 GUARD_BLOCK='herdr() {
     if [[ "${1:-}" == "update" ]]; then
@@ -112,17 +116,17 @@ zig_complete() {
 }
 
 ensure_zig() {
-    local managed="$HOME/.local/share/herdr/zig-$ZIG_VERSION/zig"
+    local managed="$ZIG_ROOT/zig"
     if zig_complete "$managed"; then
         say "zig $ZIG_VERSION installation found at ${managed%/*}"
-        ZIG_BIN="$managed"
+        ZIG="$managed"
         return
     fi
     if command -v zig >/dev/null 2>&1 \
         && [[ "$(zig version 2>/dev/null)" == "$ZIG_VERSION" ]] \
         && zig_complete "$(command -v zig)"; then
         say "zig $ZIG_VERSION complete installation found on PATH"
-        ZIG_BIN="zig"
+        ZIG="zig"
         return
     fi
     say "installing zig $ZIG_VERSION to ${managed%/*} (user space; other zig versions untouched)"
@@ -142,81 +146,38 @@ ensure_zig() {
     mkdir -p "$(dirname "$root")"
     rm -rf "$root"  # herdr-owned tree only; never touches ~/.local/bin/zig
     cp -a "$tmp/$extracted" "$root"
-    ZIG_BIN="$root/zig"
+    ZIG="$root/zig"
 }
 
-ensure_repo() {
-    if [[ ! -e "$REPO" ]]; then
-        say "cloning fork into $REPO"
-        git clone "$FORK_URL" "$REPO"
-        return
-    fi
-    if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-        die "$REPO exists but is not a git repository; move it away and re-run"
-    fi
-    say "repo exists: $REPO"
-    if [[ -n "$(git -C "$REPO" status --porcelain)" ]]; then
-        echo "error: $REPO has uncommitted changes; refusing to touch it" >&2
-        git -C "$REPO" status --short >&2
-        exit 1
-    fi
+# Shallow-clone only branch $BRANCH at its current HEAD; no other history or
+# branches. The clone lives in the throwaway $WORK dir and is removed by the
+# EXIT trap in main().
+clone_fork() {
+    say "cloning $FORK_URL ($BRANCH, --depth=1)"
+    git clone --depth=1 --branch "$BRANCH" "$FORK_URL" "$WORK/repo"
+    HEAD_SHA="$(git -C "$WORK/repo" rev-parse --short HEAD)"
+    say "checked out $BRANCH @ $HEAD_SHA"
 }
 
-ensure_remotes() {
-    cd "$REPO"
-    if git remote get-url origin >/dev/null 2>&1; then
-        [[ "$(git remote get-url origin)" == "$FORK_URL" ]] || git remote set-url origin "$FORK_URL"
-    else
-        git remote add origin "$FORK_URL"
+# Build the release binary into the shared cargo target dir. On failure,
+# clear the shared cache once and retry (self-heals stale/corrupt cache
+# state); if the retry also fails, exit non-zero so install is skipped.
+build_release() {
+    local dir="$1"
+    if ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" ZIG="$ZIG" cargo build --release --locked ); then
+        return 0
     fi
-    # upstream and any other remotes are deliberately left untouched: they are
-    # only needed for fork maintenance, which happens on the developer machine.
-}
-
-ensure_branch() {
-    cd "$REPO"
-    [[ "$(git branch --show-current)" == "$BRANCH" ]] && return
-    if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
-        git checkout "$BRANCH"
-    else
-        git checkout -b "$BRANCH" "origin/$BRANCH"
-    fi
-}
-
-# After `git fetch origin`, follow origin/$BRANCH fast-forward only (same as
-# update-herdr): keep the branch when already at or behind origin; refuse
-# clearly when diverged so local commits are never discarded silently. No
-# reset --hard, no rebase, no force.
-follow_origin() {
-    cd "$REPO"
-    git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null 2>&1 \
-        || die "origin/$BRANCH not found after fetch (cannot update)"
-    local head remote
-    head="$(git rev-parse --short HEAD)"
-    remote="$(git rev-parse --short "origin/$BRANCH")"
-    if [[ "$head" == "$remote" ]]; then
-        say "already up to date with origin/$BRANCH"
-        return
-    fi
-    if git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
-        say "fast-forward $BRANCH to origin/$BRANCH"
-        git merge --ff-only "origin/$BRANCH"
-        say "now at $(git rev-parse --short HEAD)"
-        return
-    fi
-    die "local '$BRANCH' diverges from origin/$BRANCH; refusing to discard local commits (resolve manually or re-run from the developer machine)"
+    say "build failed; clearing cargo cache $CARGO_TARGET_DIR and retrying once"
+    rm -rf "$CARGO_TARGET_DIR"
+    ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" ZIG="$ZIG" cargo build --release --locked )
 }
 
 build_and_install() {
-    cd "$REPO"
-    local head_sha
-    head_sha="$(git rev-parse --short HEAD)"
-    say "cargo build --release (channel=tabbycwd, id=$head_sha, zig=$ZIG_BIN)"
-    HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$head_sha" ZIG="$ZIG_BIN" cargo build --release --locked
+    build_release "$WORK/repo"
     say "install -> $BIN_DIR/herdr"
-    install -Dm755 target/release/herdr "$BIN_DIR/herdr"
+    install -Dm755 "$CARGO_TARGET_DIR/release/herdr" "$BIN_DIR/herdr"
     say "install -> $BIN_DIR/update-herdr"
-    install -Dm755 scripts/update-herdr "$BIN_DIR/update-herdr"
+    install -Dm755 "$WORK/repo/scripts/update-herdr" "$BIN_DIR/update-herdr"
 }
 
 ensure_bashrc_path() {
@@ -253,13 +214,12 @@ check_version_format() {
 }
 
 verify() {
-    local version sha upstream_version
+    local version upstream_version
     version="$("$BIN_DIR/herdr" --version)"
-    sha="$(git -C "$REPO" rev-parse --short HEAD)"
-    if upstream_version="$(check_version_format "$version" "$sha")"; then
-        say "installed: herdr $upstream_version+tabbycwd.$sha"
+    if upstream_version="$(check_version_format "$version" "$HEAD_SHA")"; then
+        say "installed: herdr $upstream_version+tabbycwd.$HEAD_SHA"
     else
-        die "unexpected version (expected 'herdr <ver>+tabbycwd.$sha'): $version"
+        die "unexpected version (expected 'herdr <ver>+tabbycwd.$HEAD_SHA'): $version"
     fi
 }
 
@@ -271,6 +231,8 @@ main() {
         echo "main() reached (test)"
         return
     fi
+    WORK="$(mktemp -d)"
+    trap 'rm -rf "$WORK"' EXIT
     require_linux
     require_commands
     ensure_bin_dir
@@ -278,13 +240,7 @@ main() {
     ensure_binstall
     ensure_nextest
     ensure_zig
-    ensure_repo
-    ensure_remotes
-    cd "$REPO"
-    echo "== git fetch origin =="
-    git fetch origin
-    ensure_branch
-    follow_origin
+    clone_fork
     build_and_install
     ensure_bashrc_path
     ensure_bashrc_guard
@@ -293,7 +249,7 @@ main() {
     echo "install complete."
     echo "  binary:  $BIN_DIR/herdr"
     echo "  updater: $BIN_DIR/update-herdr"
-    echo "  repo:    $REPO (branch $BRANCH)"
+    echo "  source:  temporary clone (removed)"
     echo "update with: update-herdr   (or: update-herdr --check)"
 }
 
