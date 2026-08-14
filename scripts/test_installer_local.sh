@@ -51,8 +51,23 @@ mkdir -p "$fakebin"
 cat > "$fakebin/cargo" <<'EOF'
 #!/bin/bash
 case "${1:-}" in
-    --version|fmt|clippy) exit 0 ;;
+    --version) exit 0 ;;
+    fmt)
+        [[ "${2:-}" == "--version" ]] && exit 0
+        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for fmt --check" >&2; exit 1; }
+        exit 0
+        ;;
+    clippy)
+        [[ "${2:-}" == "--version" ]] && exit 0
+        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for clippy" >&2; exit 1; }
+        exit 0
+        ;;
+    nextest)
+        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for nextest" >&2; exit 1; }
+        exit 0
+        ;;
     build)
+        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for build" >&2; exit 1; }
         if [[ "${FAKE_BUILD_FAIL:-0}" == "1" ]]; then
             echo "error: fake build failure" >&2
             exit 1

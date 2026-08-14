@@ -83,7 +83,9 @@ resolve_zig() {
 preflight_build_deps() {
     require_cmd cargo
     require_cmd rustc
-    ZIG="$(resolve_zig)"
+    # Export so every later cargo subprocess (fmt/clippy/nextest via --check,
+    # and build_release) resolves vendored libghostty-vt's zig 0.15.2.
+    export ZIG="$(resolve_zig)"
 }
 
 preflight_check_deps() {
