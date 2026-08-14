@@ -27,7 +27,10 @@ grep -q '0.15.2' "$INSTALLER" || fail "installer zig version not pinned to 0.15.
 grep -qE 'force-with-lease|git push' "$UPDATER" && fail "update-herdr must not push (GitHub auth)"
 grep -qE 'git fetch upstream|upstream/master|force-with-lease' "$UPDATER" && fail "update-herdr must not reference upstream/rebase/push"
 grep -q 'follow_origin' "$UPDATER" || fail "update-herdr missing follow_origin fast-forward logic"
-ok "static checks (no push/upstream in update-herdr)"
+grep -qE 'git fetch upstream|git rebase|ensure_rebased|git push|force-with-lease' "$INSTALLER" && fail "installer must not fetch upstream/rebase/push"
+grep -q 'follow_origin' "$INSTALLER" || fail "installer missing follow_origin fast-forward logic"
+grep -qE 'install -Dm755 scripts/update-herdr' "$INSTALLER" || fail "installer must redeploy scripts/update-herdr to \$BIN_DIR"
+ok "static checks (no push/upstream in installer+updater)"
 
 # --- isolated environment ---------------------------------------------------
 tmp="$(mktemp -d)"
@@ -237,8 +240,16 @@ git -C "$tmp/seed" push -q origin local/tabby-cwd
 git clone -q "$tmp/fork.git" "$REPO"
 ( ensure_remotes )
 [[ "$(git -C "$REPO" remote get-url origin)" == "https://github.com/unitea1992/herdr.git" ]] || fail "origin not fork URL"
-[[ "$(git -C "$REPO" remote get-url upstream)" == "https://github.com/herdrdev/herdr.git" ]] || fail "upstream not set"
-ok "remotes guaranteed (origin=unitea1992/herdr, upstream=herdrdev/herdr)"
+if git -C "$REPO" remote get-url upstream >/dev/null 2>&1; then
+    fail "installer created unnecessary upstream remote"
+fi
+ok "install: origin=fork URL, upstream not created"
+
+# An existing upstream remote is left untouched (still useful on a dev machine).
+git -C "$REPO" remote add upstream "https://github.com/herdrdev/herdr.git"
+( ensure_remotes )
+[[ "$(git -C "$REPO" remote get-url upstream)" == "https://github.com/herdrdev/herdr.git" ]] || fail "existing upstream remote changed/deleted"
+ok "existing upstream remote left untouched"
 
 ensure_branch
 [[ "$(git -C "$REPO" branch --show-current)" == "local/tabby-cwd" ]] || fail "branch not local/tabby-cwd"
@@ -290,6 +301,48 @@ fi
 echo "$out" | grep -q 'dirty' || fail "dirty message missing"
 [[ -f "$REPO/user.txt" ]] || fail "dirty file was destroyed"
 ok "update: dirty tree rejected before any fetch/build"
+
+# --- installer origin-follow (same model as update-herdr) ----------------------
+cd "$REPO_ROOT"
+# Fresh clone = first install; repo already tracks origin/local/tabby-cwd.
+rm -rf "$REPO"
+git clone -q "$tmp/fork.git" "$REPO"
+git -C "$REPO" checkout -q local/tabby-cwd
+( cd "$REPO" && git fetch origin -q && ensure_branch && follow_origin ) >/dev/null
+[[ "$(git -C "$REPO" rev-parse --short HEAD)" == "$(git -C "$REPO" rev-parse --short origin/local/tabby-cwd)" ]] || fail "fresh clone not on origin/local/tabby-cwd"
+ok "install: fresh clone tracks origin/local/tabby-cwd"
+
+FORK_URL="$tmp/fork.git"   # keep ensure_remotes' origin off the real network
+install_flow() { cd "$REPO" && ensure_repo && ensure_remotes && git fetch origin -q && ensure_branch && follow_origin; }
+
+# origin updated -> installer re-run fast-forwards.
+git -C "$tmp/seed" checkout -q local/tabby-cwd
+git -C "$tmp/seed" commit -q --allow-empty -m "installer ff"
+git -C "$tmp/seed" push -q origin local/tabby-cwd
+( install_flow ) >/dev/null
+[[ "$(git -C "$REPO" rev-parse --short HEAD)" == "$(git -C "$REPO" rev-parse --short origin/local/tabby-cwd)" ]] || fail "installer re-run did not fast-forward"
+[[ "$(git -C "$REPO" remote get-url origin)" == "$FORK_URL" ]] || fail "ensure_remotes did not point origin at fork URL"
+ok "install: existing repo behind -> installer re-run fast-forwards"
+
+# Up to date now.
+head_before="$(git -C "$REPO" rev-parse HEAD)"
+( install_flow ) >/dev/null
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_before" ]] || fail "installer re-run moved HEAD when already latest"
+ok "install: already latest -> proceeds, HEAD unchanged"
+
+# diverged -> installer refuses without destroying local commits.
+git -C "$tmp/seed" checkout -q local/tabby-cwd
+git -C "$tmp/seed" commit -q --allow-empty -m "origin diverge"
+git -C "$tmp/seed" push -q origin local/tabby-cwd
+( cd "$REPO" && git fetch origin -q )
+git -C "$REPO" commit -q --allow-empty -m "local diverge"
+head_diverge="$(git -C "$REPO" rev-parse HEAD)"
+if out="$(install_flow 2>&1)"; then
+    fail "installer accepted a diverged branch"
+fi
+echo "$out" | grep -qi diverge || fail "installer diverged error lacks the word diverge"
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$head_diverge" ]] || fail "installer diverge path lost local commit"
+ok "install: diverged -> explicit error, no destruction"
 
 # --- version format ------------------------------------------------------------
 up="$(check_version_format "herdr 0.8.0+tabbycwd.abcdef12" "abcdef12")" || fail "valid version rejected"

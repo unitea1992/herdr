@@ -62,11 +62,13 @@ cwd に追従します。
 インストーラは冪等(再実行しても安全)で、dirty なチェックアウトには触れません。
 rustup/cargo-binstall/cargo-nextest/Zig 0.15.2 の完全ツリー
 (`$HOME/.local/share/herdr/zig-0.15.2/`)が無い場合だけインストールし、
-フォークを clone、リモートを設定、`local/tabby-cwd` を checkout、
-`upstream/master` に遅れていれば rebase(コンフリクトは自動解決しません)、
-独自の version metadata 付きでビルドし、バイナリと `scripts/update-herdr` を
-インストールします。`.bashrc` の編集(PATH 追記 + `herdr()` 更新ガード)は
-marker でガードされ、二重に追記されることはありません。
+フォークを clone、origin をフォーク URL に保証し、`local/tabby-cwd` を
+checkout、`origin/local/tabby-cwd` へ fast-forward のみで追従(既に最新なら
+そのまま、diverge していれば明確なエラーで中止)、独自の version metadata
+付きでビルドし、バイナリと `scripts/update-herdr` をインストールします
+(updater の再配置は毎回行われるため、再実行で最新の updater に移行できます)。
+`.bashrc` の編集(PATH 追記 + `herdr()` 更新ガード)は marker でガードされ、
+二重に追記されることはありません。
 
 ## 更新フロー
 
@@ -149,5 +151,5 @@ stable / preview チャネルの出力は変わりません。
   明確なエラーで停止します。通常は開発マシン側の配布状態と rebase 済みの
   追従状態をそのまま使います。ローカルの独自コミットが必要なら手動で
   merge/rebase してください。
-- インストーラの初期セットアップだけは `upstream/master` への rebase を
-  試み、コンフリクト時は中断します(初期セットアップのみ)。
+- インストーラも `update-herdr` と同じく fast-forward のみで追従し、
+  diverge 時は中断します(初期セットアップのみ)。

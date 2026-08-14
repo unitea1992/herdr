@@ -19,7 +19,6 @@ REPO="${HERDR_LOCAL_REPO:-$HOME/projects/herdr}"
 BIN_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
 BRANCH="local/tabby-cwd"
 FORK_URL="https://github.com/unitea1992/herdr.git"
-UPSTREAM_URL="https://github.com/herdrdev/herdr.git"
 ZIG_VERSION="0.15.2"
 
 GUARD_BLOCK='herdr() {
@@ -170,11 +169,8 @@ ensure_remotes() {
     else
         git remote add origin "$FORK_URL"
     fi
-    if git remote get-url upstream >/dev/null 2>&1; then
-        [[ "$(git remote get-url upstream)" == "$UPSTREAM_URL" ]] || git remote set-url upstream "$UPSTREAM_URL"
-    else
-        git remote add upstream "$UPSTREAM_URL"
-    fi
+    # upstream and any other remotes are deliberately left untouched: they are
+    # only needed for fork maintenance, which happens on the developer machine.
 }
 
 ensure_branch() {
@@ -187,20 +183,28 @@ ensure_branch() {
     fi
 }
 
-ensure_rebased() {
+# After `git fetch origin`, follow origin/$BRANCH fast-forward only (same as
+# update-herdr): keep the branch when already at or behind origin; refuse
+# clearly when diverged so local commits are never discarded silently. No
+# reset --hard, no rebase, no force.
+follow_origin() {
     cd "$REPO"
-    git rev-parse --verify -q upstream/master >/dev/null || die "upstream/master not found after fetch"
-    if [[ "$(git rev-list --count HEAD..upstream/master)" == "0" ]]; then
-        say "branch is up to date with upstream/master"
+    git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null 2>&1 \
+        || die "origin/$BRANCH not found after fetch (cannot update)"
+    local head remote
+    head="$(git rev-parse --short HEAD)"
+    remote="$(git rev-parse --short "origin/$BRANCH")"
+    if [[ "$head" == "$remote" ]]; then
+        say "already up to date with origin/$BRANCH"
         return
     fi
-    say "rebase $BRANCH onto upstream/master"
-    if ! git rebase upstream/master; then
-        echo "error: rebase conflicts; aborting (resolve manually, then run update-herdr)" >&2
-        git diff --name-only --diff-filter=U >&2
-        git rebase --abort
-        exit 1
+    if git merge-base --is-ancestor HEAD "origin/$BRANCH"; then
+        say "fast-forward $BRANCH to origin/$BRANCH"
+        git merge --ff-only "origin/$BRANCH"
+        say "now at $(git rev-parse --short HEAD)"
+        return
     fi
+    die "local '$BRANCH' diverges from origin/$BRANCH; refusing to discard local commits (resolve manually or re-run from the developer machine)"
 }
 
 build_and_install() {
@@ -277,11 +281,10 @@ main() {
     ensure_repo
     ensure_remotes
     cd "$REPO"
-    echo "== git fetch origin + upstream =="
+    echo "== git fetch origin =="
     git fetch origin
-    git fetch upstream
     ensure_branch
-    ensure_rebased
+    follow_origin
     build_and_install
     ensure_bashrc_path
     ensure_bashrc_guard
