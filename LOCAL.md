@@ -2,9 +2,8 @@
 
 このリポジトリは `herdrdev/herdr`
 (<https://github.com/herdrdev/herdr>) の個人フォークで、**Linux専用**です:
-インストーラ、アップデータ、チェックモードは Windows/macOS ターゲット、
-PowerShell、`just` を一切使いません。上流の `README.md` は意図的に
-変更していません。
+インストーラ / アップデータは Windows/macOS ターゲット、PowerShell、
+`just` を一切使いません。上流の `README.md` は意図的に変更していません。
 
 ## 開発マシンと利用マシンの区別
 
@@ -55,10 +54,8 @@ cwd に追従します。
   (アップデータはエラー)。`$HOME/.local/bin/zig` は PATH 上の他の zig を壊さない
   ために一切使いません(旧インストーラが作った壊れた単体 zig がそこにあっても
   無視し、削除もしません)。
-- Rust CLI は **cargo-binstall** で管理します(ユーザ空間、sudo/apt 不要):
-  `cargo-binstall` 本体と `cargo-nextest`(`update-herdr --check` でのみ必要)。
-- インストーラと `--check` は `just` を使わないため、PATH に古い apt の
-  `just` があっても無関係です。
+- Rust toolchain は **rustup** で導入します(ユーザ空間、sudo/apt 不要)。
+  追加の cargo ツール(cargo-binstall / cargo-nextest など)は使いません。
 
 ## ワンラインインストール(新しい Linux マシン)
 
@@ -68,15 +65,14 @@ cwd に追従します。
 
 - `HERDR_LOCAL_BIN` — バイナリ配置ディレクトリ(デフォルト `$HOME/.local/bin`)
 
-インストーラは冪等(再実行しても安全)です。rustup / cargo-binstall /
-cargo-nextest / Zig 0.15.2 の完全ツリーが無い場合だけ用意し、フォークを
-`local/tabby-cwd` から `--depth=1` で一時ディレクトリへ shallow clone、
-build は `CARGO_TARGET_DIR="$HOME/.cache/herdr/target"` の共有 cache を使い、
-成功時のみ `herdr` と `scripts/update-herdr` を `$BIN_DIR` へ install します。
-build 失敗時は既存の installed binary を上書きせず、cache を一度消して再試行
-します。一時 clone は成功・失敗どちらでも削除されます。`.bashrc` の編集
-(PATH 追記 + `herdr()` 更新ガード)は marker でガードされ、二重に追記される
-ことはありません。
+インストーラは冪等(再実行しても安全)です。rustup による Rust toolchain と
+Zig 0.15.2 の完全ツリーが無い場合だけ用意し、フォークを `local/tabby-cwd`
+から `--depth=1` で一時ディレクトリへ shallow clone、build は
+`CARGO_TARGET_DIR="$HOME/.cache/herdr/target"` の共有 cache を使い、成功時のみ
+`herdr` と `scripts/update-herdr` を `$BIN_DIR` へ install します。build 失敗時は
+既存の installed binary を上書きしません。一時 clone は成功・失敗どちらでも
+削除されます。`.bashrc` の編集(PATH 追記 + `herdr()` 更新ガード)は marker で
+ガードされ、二重に追記されることはありません。
 
 ## 利用マシンに残るもの
 
@@ -98,32 +94,26 @@ source repo の永続 checkout(`$HOME/projects/herdr` など)は作りません�
 2. `mktemp -d` の一時ディレクトリへ `local/tabby-cwd` を `--depth=1` で
    shallow clone。
 3. HEAD の short SHA を取得。
-4. `CARGO_TARGET_DIR="$HOME/.cache/herdr/target"` で release build
-   (失敗時は cache を一度消して再試行)。
+4. `CARGO_TARGET_DIR="$HOME/.cache/herdr/target"` で release build。
 5. 成功時のみ installed `herdr` を置換し、clone 内の最新
    `scripts/update-herdr` を `$BIN_DIR/update-herdr` へ再配置(self-update)。
 6. version 表示、一時 clone を削除。
 
 `fetch` / rebase / push / upstream 操作は利用マシンでは行いません
 (GitHub 認証不要)。実行中の herdr server は停止・再起動しません。都合の
-良いタイミングで再起動してください。
-
-### `update-herdr --check`
-
-一時 clone 上で Linux ネイティブのチェック(`cargo fmt --check`、
-`cargo clippy --all-targets --locked -- -D warnings`、
-`cargo nextest run --locked`、`cargo build --release --locked`)を
-**インストールなしで**実行します。installed binary と updater 自身は
-変更しません。`x86_64-pc-windows-msvc` ターゲットは追加せず、Windows/macOS
-の lint も実行しません。不足している依存(zig の完全ツリー含む)は自動
-インストールせず、installer への誘導とともにエラー終了します。
+良いタイミングで再起動してください。検証モード(`--check` など)はありません。
 
 ### 共有 build cache の復旧
 
-`~/.cache/herdr/target` は無くても正常動作し、build 失敗時は一度削除して
-再試行します。それでも壊れている場合は手動で削除して再実行してください:
+`~/.cache/herdr/target` は無くても正常動作し、build が壊れていると感じたら
+手動で削除して再実行してください:
 
     rm -rf ~/.cache/herdr/target && update-herdr
+
+インストーラでも復旧できます:
+
+    rm -rf ~/.cache/herdr/target
+    curl -fsSL https://raw.githubusercontent.com/unitea1992/herdr/local/tabby-cwd/install-tabbycwd.sh | bash
 
 ## 旧インストールからの移行
 

@@ -3,19 +3,11 @@
 # (unitea1992/herdr, branch local/tabby-cwd). This script is the source of
 # truth; the installer copies it to $BIN_DIR/update-herdr.
 #
-# Usage: update-herdr [--check]
-#   no flags  shallow-clone local/tabby-cwd into a throwaway temp dir, build
-#             the release binary with custom version metadata, install it to
-#             $BIN_DIR/herdr, and re-install this updater from the clone.
-#   --check   same throwaway clone, then run Linux-native checks (fmt, clippy,
-#             nextest, release build) WITHOUT installing anything.
-#
-# This fork is Linux-only: never installs or runs Windows/macOS targets,
-# PowerShell tooling, or the official updater (`herdr update` is blocked by
-# the .bashrc wrapper). Checks never depend on `just`. Each run clones fresh
-# (public, unauthenticated) and removes the clone; there is no persistent
-# source checkout, no fetch/rebase/push on the user machine. Rebuilds are
-# shared through $HOME/.cache/herdr/target.
+# Each run shallow-clones local/tabby-cwd into a throwaway temp dir, builds
+# the release binary with custom version metadata into the shared cargo
+# target dir, replaces installed herdr and this updater, prints the version,
+# and removes the clone. No checks, no fetch/rebase/push, no persistent
+# source checkout, no GitHub auth.
 set -euo pipefail
 
 BIN_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
@@ -26,17 +18,6 @@ ZIG_VERSION="0.15.2"
 ZIG_ROOT="$HOME/.local/share/herdr/zig-$ZIG_VERSION"
 CARGO_TARGET_DIR="$HOME/.cache/herdr/target"
 export CARGO_TARGET_DIR
-
-check_mode=0
-for arg in "$@"; do
-    case "$arg" in
-        --check) check_mode=1 ;;
-        *)
-            echo "usage: update-herdr [--check]" >&2
-            exit 2
-            ;;
-    esac
-done
 
 die() {
     echo "error: $*" >&2
@@ -50,8 +31,7 @@ require_cmd() {
 
 # Resolve zig 0.15.2 as a complete installation (zig binary + lib/ + docs
 # tree), the layout the installer keeps under $ZIG_ROOT/. Resolution: the
-# herdr-managed complete tree first (this also heals the old broken lone
-# $HOME/.local/bin/zig layout), then an exact-version PATH zig whose real
+# herdr-managed complete tree first, then an exact-version PATH zig whose real
 # location has a lib/ next to it. A bare single zig binary is never usable
 # (Zig needs its installation tree for the vendored libghostty-vt build), so
 # it is never picked.
@@ -83,23 +63,9 @@ resolve_zig() {
 preflight_build_deps() {
     require_cmd cargo
     require_cmd rustc
-    # Export so every later cargo subprocess (fmt/clippy/nextest via --check,
-    # and build_release) resolves vendored libghostty-vt's zig 0.15.2.
+    # Export so the cargo subprocess below resolves vendored libghostty-vt's
+    # zig 0.15.2, and the updater never installs anything extra.
     export ZIG="$(resolve_zig)"
-}
-
-preflight_check_deps() {
-    preflight_build_deps
-    if ! command -v cargo-nextest >/dev/null 2>&1; then
-        cat >&2 <<'EOF'
-ERROR: cargo-nextest is required for --check.
-Install with:
-  cargo binstall cargo-nextest --no-confirm
-EOF
-        exit 1
-    fi
-    cargo fmt --version >/dev/null 2>&1 || die "rustfmt is missing; install with: rustup component add rustfmt"
-    cargo clippy --version >/dev/null 2>&1 || die "clippy is missing; install with: rustup component add clippy"
 }
 
 # Shallow-clone only branch $BRANCH at its current HEAD; no other history or
@@ -112,51 +78,11 @@ clone_fork() {
     echo "== checked out $BRANCH @ $HEAD_SHA =="
 }
 
-# Build the release binary into the shared cargo target dir. On failure,
-# clear the shared cache once and retry (self-heals stale/corrupt cache
-# state); if the retry also fails, exit non-zero so install is skipped.
+# Build the release binary into the shared cargo target dir; non-zero on
+# failure so install is skipped and the installed binary stays untouched.
 build_release() {
     local dir="$1"
-    if ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" ZIG="$ZIG" cargo build --release --locked ); then
-        return 0
-    fi
-    echo "== build failed; clearing cargo cache $CARGO_TARGET_DIR and retrying once =="
-    rm -rf "$CARGO_TARGET_DIR"
-    ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" ZIG="$ZIG" cargo build --release --locked )
-}
-
-build_and_install() {
-    preflight_build_deps
-    build_release "$WORK/repo"
-    echo "== install to $BINARY =="
-    install -Dm755 "$CARGO_TARGET_DIR/release/herdr" "$BINARY"
-    echo "== self-update $BIN_DIR/update-herdr =="
-    install -Dm755 "$WORK/repo/scripts/update-herdr" "$BIN_DIR/update-herdr"
-}
-
-run_checks() {
-    preflight_check_deps
-    local head_sha
-    head_sha="$HEAD_SHA"
-
-    # fmt/clippy/nextest run on the stable channel: the test suite asserts
-    # env!("CARGO_PKG_VERSION") (e.g. tests/api_ping.rs), so custom version
-    # metadata is applied only to the release build below, matching how the
-    # artifact is produced.
-    echo "== cargo fmt --check =="
-    ( cd "$WORK/repo" && cargo fmt --check )
-    echo "== cargo clippy --all-targets --locked -- -D warnings =="
-    ( cd "$WORK/repo" && cargo clippy --all-targets --locked -- -D warnings )
-    echo "== cargo nextest run --locked =="
-    ( cd "$WORK/repo" && cargo nextest run --locked \
-        --status-level fail \
-        --final-status-level slow \
-        --failure-output final \
-        --success-output never )
-    echo "== cargo build --release --locked (channel=tabbycwd, id=$head_sha, no install) =="
-    ( cd "$WORK/repo" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$head_sha" ZIG="$ZIG" cargo build --release --locked )
-    echo "== built binary version =="
-    "$CARGO_TARGET_DIR/release/herdr" --version
+    ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" cargo build --release --locked )
 }
 
 main() {
@@ -164,22 +90,17 @@ main() {
     WORK="$(mktemp -d)"
     trap 'rm -rf "$WORK"' EXIT
     clone_fork
-
-    if [[ "$check_mode" == 1 ]]; then
-        run_checks
-    else
-        build_and_install
-    fi
-
+    preflight_build_deps
+    build_release "$WORK/repo"
+    echo "== install to $BINARY =="
+    install -Dm755 "$CARGO_TARGET_DIR/release/herdr" "$BINARY"
+    echo "== self-update $BIN_DIR/update-herdr =="
+    install -Dm755 "$WORK/repo/scripts/update-herdr" "$BIN_DIR/update-herdr"
     echo
     echo "HEAD: $HEAD_SHA"
     echo
-    if [[ "$check_mode" == 1 ]]; then
-        echo "check mode: Linux-native checks passed; installed binary untouched"
-    else
-        "$BINARY" --version
-        echo "note: a running herdr server is still the old binary; restart it at a convenient time"
-    fi
+    "$BINARY" --version
+    echo "note: a running herdr server is still the old binary; restart it at a convenient time"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

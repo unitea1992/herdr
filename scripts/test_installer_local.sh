@@ -19,12 +19,9 @@ for f in "$INSTALLER" "$UPDATER"; do
 done
 ok "no /home/helios hardcode; no windows/macos/ps1 references"
 
-grep -q 'nextest run' "$UPDATER" || fail "update-herdr --check missing nextest"
-grep -q 'HERDR_LOCAL_BIN' "$INSTALLER" || fail "installer missing HERDR_LOCAL_BIN"
-grep -q '0.15.2' "$INSTALLER" || fail "installer zig not pinned to 0.15.2"
-grep -q '0.15.2' "$UPDATER" || fail "updater zig not pinned to 0.15.2"
-
 for f in "$INSTALLER" "$UPDATER"; do
+    grep -qnE 'check_mode|run_checks|preflight_check_deps|cargo nextest|cargo clippy|cargo fmt --check|cargo-binstall|cargo-nextest|cargo binstall|--check' "$f" \
+        && fail "$f still carries check/nextest/clippy/fmt machinery"
     grep -qE 'git push|force-with-lease' "$f" && fail "$f must not push (GitHub auth)"
     grep -qE 'git rebase|git fetch|fetch upstream|remote.*upstream' "$f" && fail "$f must not fetch/rebase/upstream"
     grep -q 'HERDR_LOCAL_REPO' "$f" && fail "$f must not reference HERDR_LOCAL_REPO (no persistent repo)"
@@ -34,12 +31,10 @@ for f in "$INSTALLER" "$UPDATER"; do
     grep -q 'mktemp -d' "$f" || fail "$f missing throwaway temp dir"
     grep -q 'trap.*EXIT' "$f" || fail "$f missing cleanup trap"
 done
-ok "no push/rebase/upstream/fetch/persistent-repo in installer+updater"
+ok "no --check/nextest/clippy/fmt/binstall; no push/rebase/upstream/persistent-repo"
 
 grep -qE 'install -Dm755 .*update-herdr' "$INSTALLER" || fail "installer must deploy update-herdr"
-grep -qE 'install -Dm755 .*update-herdr' "$UPDATER" || fail "updater must self-update"
-grep -qE -- '--clean|clean_mode|cargo clean' "$UPDATER" && fail "update-herdr must not keep --clean"
-ok "installer deploys updater; updater self-updates; --clean removed"
+grep -qE 'install .*update-herdr' "$UPDATER" || fail "updater must self-update"
 
 # --- isolated environment ----------------------------------------------------
 tmp="$(mktemp -d)"
@@ -52,20 +47,6 @@ cat > "$fakebin/cargo" <<'EOF'
 #!/bin/bash
 case "${1:-}" in
     --version) exit 0 ;;
-    fmt)
-        [[ "${2:-}" == "--version" ]] && exit 0
-        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for fmt --check" >&2; exit 1; }
-        exit 0
-        ;;
-    clippy)
-        [[ "${2:-}" == "--version" ]] && exit 0
-        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for clippy" >&2; exit 1; }
-        exit 0
-        ;;
-    nextest)
-        [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for nextest" >&2; exit 1; }
-        exit 0
-        ;;
     build)
         [[ -n "${ZIG:-}" ]] || { echo "fake: ZIG unset for build" >&2; exit 1; }
         if [[ "${FAKE_BUILD_FAIL:-0}" == "1" ]]; then
@@ -82,7 +63,7 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$fakebin/cargo"
-for c in rustc cargo-binstall cargo-nextest curl; do
+for c in rustc curl; do
     printf '#!/bin/bash\nexit 0\n' > "$fakebin/$c"
     chmod +x "$fakebin/$c"
 done
@@ -113,8 +94,8 @@ printf '#!/bin/bash\n[[ "${1:-}" == version ]] && echo 0.15.2\nexit 0\n' \
     > "$home/.local/share/herdr/zig-0.15.2/zig"
 chmod +x "$home/.local/share/herdr/zig-0.15.2/zig"
 
-# Run the full installer/updater main() in an isolated subshell, sourcing the
-# script so FORK_URL can point at the local bare repo (no network).
+# Run the installer/updater main() in an isolated subshell, sourcing the
+# script so FORK_URL can point at the local bare fork repo (no network).
 run_installer() { # $1 = optional extra env (e.g. FAKE_BUILD_FAIL=1)
     (
         export HOME="$home" HERDR_LOCAL_BIN="$home/.local/bin" TMPDIR="$work"
@@ -125,7 +106,7 @@ run_installer() { # $1 = optional extra env (e.g. FAKE_BUILD_FAIL=1)
         main
     )
 }
-run_updater() { # $@ = updater flags (e.g. --check); parsed by the sourced script
+run_updater() {
     (
         export HOME="$home" HERDR_LOCAL_BIN="$home/.local/bin" TMPDIR="$work"
         export PATH="$fakebin:$PATH"
@@ -184,13 +165,6 @@ if out="$( ( export PATH="$tmp/emptybin"; export HOME="$home"; source "$UPDATER"
 fi
 echo "$out" | grep -q "required command 'cargo'" || fail "missing-cargo error"
 ok "missing cargo errors clearly"
-
-if out="$( ( export PATH="$tmp/shim:/usr/bin:/bin"; export HOME="$home"; source "$UPDATER"; preflight_check_deps ) 2>&1 )"; then
-    fail "preflight_check_deps passed without cargo-nextest"
-fi
-echo "$out" | grep -q 'cargo-nextest' || fail "missing nextest error"
-echo "$out" | grep -q 'cargo binstall cargo-nextest --no-confirm' || fail "missing binstall hint"
-ok "missing cargo-nextest errors with binstall hint"
 
 # --- .bashrc edits are marker-guarded and idempotent -------------------------
 bh="$tmp/bhome"; mkdir -p "$bh"
@@ -259,13 +233,12 @@ expect_rc 0 "$tmp/install2.log" run_installer
 [[ $(grep -c '^herdr()' "$home/.bashrc" || true) == "1" ]] || fail "guard duplicated on re-run"
 ok "installer re-run idempotent"
 
-# --- installer build failure: no clobber, cleanup, cache cleared --------------
+# --- installer build failure: no clobber, cleanup -----------------------------
 before="$(cat "$home/.local/bin/herdr")"
 expect_rc 1 "$tmp/fail.log" run_installer FAKE_BUILD_FAIL=1
 [[ "$(cat "$home/.local/bin/herdr")" == "$before" ]] || fail "failed build clobbered installed binary"
 [[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "throwaway clone not cleaned up after failure"
-[[ ! -e "$home/.cache/herdr/target" ]] || fail "cache not cleared by retry after failure"
-ok "installer build failure: binary preserved, clone cleaned, cache cleared"
+ok "installer build failure: binary preserved, clone cleaned"
 
 # --- updater: normal run updates herdr + self-updates -------------------------
 printf '#!/bin/bash\necho "fake update-herdr v2"\n' > "$tmp/seed/scripts/update-herdr"
@@ -284,15 +257,6 @@ grep -q 'fake update-herdr v2' "$home/.local/bin/update-herdr" || fail "updater 
 [[ ! -e "$home/projects/herdr" ]] || fail "updater created a persistent repo"
 [[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "updater throwaway clone not cleaned up"
 ok "updater: updates herdr + self-updates, no persistent repo, clone cleaned"
-
-# --- updater --check: installed binaries untouched ----------------------------
-before="$(cat "$home/.local/bin/herdr")"
-before_upd="$(cat "$home/.local/bin/update-herdr")"
-expect_rc 0 "$tmp/chk.log" run_updater --check
-[[ "$(cat "$home/.local/bin/herdr")" == "$before" ]] || fail "--check modified installed herdr"
-[[ "$(cat "$home/.local/bin/update-herdr")" == "$before_upd" ]] || fail "--check modified installed update-herdr"
-[[ -z "$(ls -A "$work" 2>/dev/null)" ]] || fail "--check throwaway clone not cleaned up"
-ok "updater --check: installed binaries untouched, clone cleaned"
 
 # --- pre-existing ~/projects/herdr is never touched ---------------------------
 mkdir -p "$home/projects/herdr"

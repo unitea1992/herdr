@@ -8,13 +8,13 @@
 # Overrides:
 #   HERDR_LOCAL_BIN   binary dir (default $HOME/.local/bin)
 #
-# Linux-only. Installs Rust tooling (rustup, cargo-binstall, cargo-nextest)
-# and Zig 0.15.2 into user space only — no sudo, no system packages, no
-# Windows/macOS tooling. Each run shallow-clones the fork into a throwaway
-# temp dir, builds, installs, and removes the clone; no persistent source
-# checkout is created. Rebuilds are shared through $HOME/.cache/herdr/target.
-# Safe to re-run (marker-guarded .bashrc edits, no duplicates, build failure
-# never overwrites an already-installed binary).
+# Linux-only. Installs Rust tooling (rustup) and Zig 0.15.2 into user space
+# only — no sudo, no system packages, no Windows/macOS tooling. Each run
+# shallow-clones the fork into a throwaway temp dir, builds with the shared
+# $HOME/.cache/herdr/target, installs herdr + update-herdr, and removes the
+# clone; no persistent source checkout is created. Safe to re-run
+# (marker-guarded .bashrc edits, build failure never overwrites an
+# already-installed binary).
 set -euo pipefail
 
 BIN_DIR="${HERDR_LOCAL_BIN:-$HOME/.local/bin}"
@@ -82,27 +82,6 @@ ensure_rust() {
     fi
 }
 
-ensure_binstall() {
-    if command -v cargo-binstall >/dev/null 2>&1; then
-        say "cargo-binstall present"
-        return
-    fi
-    say "installing cargo-binstall (user space)"
-    curl -L --proto '=https' --tlsv1.2 -sSf \
-        https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
-        | bash
-    export PATH="$HOME/.cargo/bin:$PATH"
-}
-
-ensure_nextest() {
-    if command -v cargo-nextest >/dev/null 2>&1; then
-        say "cargo-nextest present"
-        return
-    fi
-    say "installing cargo-nextest via cargo-binstall"
-    cargo binstall cargo-nextest --no-confirm
-}
-
 # Zig 0.15.2 is kept as a complete distribution tree (zig binary + lib/ +
 # docs) under $HOME/.local/share/herdr/zig-$ZIG_VERSION/. A lone `zig` binary
 # cannot find its lib/ for the vendored libghostty-vt build, so we never drop
@@ -159,16 +138,10 @@ clone_fork() {
     say "checked out $BRANCH @ $HEAD_SHA"
 }
 
-# Build the release binary into the shared cargo target dir. On failure,
-# clear the shared cache once and retry (self-heals stale/corrupt cache
-# state); if the retry also fails, exit non-zero so install is skipped.
+# Build the release binary into the shared cargo target dir; non-zero on
+# failure so install is skipped and the installed binary stays untouched.
 build_release() {
     local dir="$1"
-    if ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" ZIG="$ZIG" cargo build --release --locked ); then
-        return 0
-    fi
-    say "build failed; clearing cargo cache $CARGO_TARGET_DIR and retrying once"
-    rm -rf "$CARGO_TARGET_DIR"
     ( cd "$dir" && HERDR_BUILD_CHANNEL=tabbycwd HERDR_BUILD_ID="$HEAD_SHA" ZIG="$ZIG" cargo build --release --locked )
 }
 
@@ -237,8 +210,6 @@ main() {
     require_commands
     ensure_bin_dir
     ensure_rust
-    ensure_binstall
-    ensure_nextest
     ensure_zig
     clone_fork
     build_and_install
@@ -250,7 +221,7 @@ main() {
     echo "  binary:  $BIN_DIR/herdr"
     echo "  updater: $BIN_DIR/update-herdr"
     echo "  source:  temporary clone (removed)"
-    echo "update with: update-herdr   (or: update-herdr --check)"
+    echo "update with: update-herdr"
 }
 
 # Executed paths: `bash install-tabbycwd.sh` (BASH_SOURCE[0] == $0) and
