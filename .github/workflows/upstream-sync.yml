@@ -31,8 +31,11 @@ jobs:
         run: |
           git fetch https://github.com/herdrdev/herdr.git master:refs/remotes/upstream/master
           UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          FORK_SHA="$(git rev-parse HEAD)"
           echo "upstream: $UPSTREAM_SHA"
-          echo "fork:     $(git rev-parse HEAD)"
+          echo "fork:     $FORK_SHA"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "fork_sha=$FORK_SHA" >> "$GITHUB_OUTPUT"
           if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
             echo "no upstream updates; nothing to do"
             echo "update=false" >> "$GITHUB_OUTPUT"
@@ -40,15 +43,15 @@ jobs:
           fi
           echo "update=true" >> "$GITHUB_OUTPUT"
 
-      - name: Rebase fork onto upstream master
+      - name: Preflight merge
         if: steps.detect.outputs.update == 'true'
         shell: bash
-        # On conflict git rebase fails the job; origin is untouched because
-        # the push step never runs. No auto-resolution.
+        # Reproduce GitHub's fork sync merge locally. On conflict the job fails
+        # before the remote branch is touched; no automatic conflict resolution.
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@users.noreply.github.com"
-          git rebase refs/remotes/upstream/master
+          git merge --no-commit --no-ff refs/remotes/upstream/master
 
       - name: Install Zig 0.15.2
         if: steps.detect.outputs.update == 'true'
@@ -67,8 +70,32 @@ jobs:
           "$ZIG" version
           cargo build --release --locked
 
-      - name: Push fork branch
+      - name: Verify refs are unchanged
         if: steps.detect.outputs.update == 'true'
-        # Force-with-lease: the rebase rewrites commit SHAs, so a plain push is
-        # a non-fast-forward. Lease still fails if the remote moved meanwhile.
-        run: git push --force-with-lease origin HEAD:local/tabby-cwd
+        shell: bash
+        # Do not sync a revision that was not covered by the preflight build.
+        run: |
+          git fetch https://github.com/herdrdev/herdr.git master:refs/remotes/upstream/master
+          git fetch origin local/tabby-cwd:refs/remotes/origin/local/tabby-cwd
+          CURRENT_UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          CURRENT_FORK_SHA="$(git rev-parse refs/remotes/origin/local/tabby-cwd)"
+          test "$CURRENT_UPSTREAM_SHA" = "${{ steps.detect.outputs.upstream_sha }}" || {
+            echo "upstream moved during validation; retry on the next run" >&2
+            exit 1
+          }
+          test "$CURRENT_FORK_SHA" = "${{ steps.detect.outputs.fork_sha }}" || {
+            echo "fork branch moved during validation; retry on the next run" >&2
+            exit 1
+          }
+
+      - name: Sync fork branch
+        if: steps.detect.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Use GitHub's fork-sync API instead of git push. This avoids PATs,
+        # force-pushes, and workflow-file push restrictions on GITHUB_TOKEN.
+        run: |
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch='local/tabby-cwd'
