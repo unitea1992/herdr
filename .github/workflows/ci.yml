@@ -20,9 +20,10 @@ concurrency:
 
 jobs:
   conventional-commits:
-    if: github.event_name != 'push' || github.ref_name == 'master'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      heavy_ci: ${{ steps.scope.outputs.heavy_ci }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -31,7 +32,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate commit subjects
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref_name == 'master'
         run: python3 scripts/conventional_commits.py --range "${{ github.event.before }}..${{ github.event.after }}"
 
       - name: Validate PR title
@@ -40,8 +41,36 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/conventional_commits.py "$PR_TITLE"
 
+      - name: Classify CI scope
+        id: scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "heavy_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED_FILES="$RUNNER_TEMP/changed-files.txt"
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$CHANGED_FILES"
+          echo "Changed files:"
+          cat "$CHANGED_FILES"
+
+          if grep -Ev '^(LOCAL\.md|\.github/workflows/upstream-sync\.yml)$' "$CHANGED_FILES" | grep -q .; then
+            echo "heavy_ci=true" >> "$GITHUB_OUTPUT"
+            echo "Heavy CI required."
+          else
+            echo "heavy_ci=false" >> "$GITHUB_OUTPUT"
+            echo "Fork-maintenance-only change; skipping heavy CI."
+          fi
+
   check:
     name: check (${{ matrix.os }})
+    needs: conventional-commits
+    if: needs.conventional-commits.outputs.heavy_ci == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -152,6 +181,8 @@ jobs:
 
   windows-conpty-package:
     name: Windows ConPTY package
+    needs: conventional-commits
+    if: needs.conventional-commits.outputs.heavy_ci == 'true'
     runs-on: windows-2022
     timeout-minutes: 25
     steps:
