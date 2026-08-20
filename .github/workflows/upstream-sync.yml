@@ -27,6 +27,7 @@ jobs:
       update: ${{ steps.detect.outputs.update }}
       upstream_sha: ${{ steps.detect.outputs.upstream_sha }}
       fork_sha: ${{ steps.detect.outputs.fork_sha }}
+      tree_sha: ${{ steps.prepare.outputs.tree_sha }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -55,16 +56,47 @@ jobs:
           fi
           echo "update=true" >> "$GITHUB_OUTPUT"
 
-      - name: Preflight merge
+      - name: Prepare validated upstream merge
+        id: prepare
         if: steps.detect.outputs.update == 'true'
         shell: bash
-        # Reproduce GitHub's fork sync merge locally. On conflict the job fails
-        # before the remote branch is touched; no automatic conflict resolution.
+        # Keep the fork's workflow directory exactly as-is. GITHUB_TOKEN cannot
+        # update workflow files, and upstream CI/release workflows are not part
+        # of the runtime code this downstream branch needs to track.
         run: |
+          set +e
           git \
             -c user.name="github-actions[bot]" \
             -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             merge --no-commit --no-ff refs/remotes/upstream/master
+          MERGE_STATUS=$?
+          set -e
+
+          git rm -r -f --ignore-unmatch .github/workflows
+          git checkout "${{ steps.detect.outputs.fork_sha }}" -- .github/workflows
+
+          UNMERGED="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$UNMERGED" ]; then
+            echo "unresolved conflicts outside .github/workflows:" >&2
+            printf '%s\n' "$UNMERGED" >&2
+            git merge --abort || true
+            exit 1
+          fi
+
+          if [ "$MERGE_STATUS" -ne 0 ]; then
+            echo "merge conflicts were limited to .github/workflows; kept fork versions"
+          fi
+
+          UPSTREAM_SHORT="${{ steps.detect.outputs.upstream_sha }}"
+          UPSTREAM_SHORT="${UPSTREAM_SHORT:0:12}"
+          git \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore: sync upstream master ${UPSTREAM_SHORT}"
+
+          TREE_SHA="$(git rev-parse HEAD^{tree})"
+          echo "validated tree: $TREE_SHA"
+          echo "tree_sha=$TREE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig 0.15.2
         if: steps.detect.outputs.update == 'true'
@@ -87,19 +119,24 @@ jobs:
     needs: validate
     if: needs.validate.outputs.update == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
+      - name: Checkout fork
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: local/tabby-cwd
+          fetch-depth: 0
+
       - name: Verify refs are unchanged
         shell: bash
         # Keep write permission isolated from the job that executes upstream code.
         # If either branch moved after validation, leave the fork untouched.
         run: |
-          CURRENT_UPSTREAM_SHA="$(git ls-remote https://github.com/herdrdev/herdr.git refs/heads/master | awk '{print $1}')"
-          CURRENT_FORK_SHA="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/local/tabby-cwd | awk '{print $1}')"
-          test -n "$CURRENT_UPSTREAM_SHA"
-          test -n "$CURRENT_FORK_SHA"
+          git fetch https://github.com/herdrdev/herdr.git master:refs/remotes/upstream/master
+          CURRENT_UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          CURRENT_FORK_SHA="$(git rev-parse HEAD)"
           test "$CURRENT_UPSTREAM_SHA" = "${{ needs.validate.outputs.upstream_sha }}" || {
             echo "upstream moved during validation; retry on the next run" >&2
             exit 1
@@ -109,15 +146,50 @@ jobs:
             exit 1
           }
 
-      - name: Sync fork branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # Use GitHub's fork-sync API instead of git push. This avoids PATs,
-        # force-pushes, and workflow-file push restrictions on GITHUB_TOKEN.
+      - name: Recreate validated merge
+        shell: bash
+        # No upstream code is executed in this write-enabled job. Recreate the
+        # already-built tree, then require its tree SHA to match validation.
         run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
-            -f branch='local/tabby-cwd'
+          set +e
+          git \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            merge --no-commit --no-ff refs/remotes/upstream/master
+          MERGE_STATUS=$?
+          set -e
+
+          git rm -r -f --ignore-unmatch .github/workflows
+          git checkout "${{ needs.validate.outputs.fork_sha }}" -- .github/workflows
+
+          UNMERGED="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$UNMERGED" ]; then
+            echo "unresolved conflicts outside .github/workflows:" >&2
+            printf '%s\n' "$UNMERGED" >&2
+            git merge --abort || true
+            exit 1
+          fi
+
+          if [ "$MERGE_STATUS" -ne 0 ]; then
+            echo "merge conflicts were limited to .github/workflows; kept fork versions"
+          fi
+
+          UPSTREAM_SHORT="${{ needs.validate.outputs.upstream_sha }}"
+          UPSTREAM_SHORT="${UPSTREAM_SHORT:0:12}"
+          git \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore: sync upstream master ${UPSTREAM_SHORT}"
+
+          TREE_SHA="$(git rev-parse HEAD^{tree})"
+          echo "sync tree:      $TREE_SHA"
+          echo "validated tree: ${{ needs.validate.outputs.tree_sha }}"
+          test "$TREE_SHA" = "${{ needs.validate.outputs.tree_sha }}" || {
+            echo "recreated merge differs from validated tree" >&2
+            exit 1
+          }
+
+      - name: Push fork branch
+        # Fast-forward only: the merge commit's first parent is the previously
+        # validated fork HEAD. No force push and no external credential needed.
+        run: git push origin HEAD:local/tabby-cwd
