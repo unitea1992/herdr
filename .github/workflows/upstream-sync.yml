@@ -6,22 +6,29 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: upstream-sync-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  sync:
+  validate:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      update: ${{ steps.detect.outputs.update }}
+      upstream_sha: ${{ steps.detect.outputs.upstream_sha }}
+      fork_sha: ${{ steps.detect.outputs.fork_sha }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: local/tabby-cwd
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Check for upstream updates
         id: detect
@@ -49,8 +56,6 @@ jobs:
         # Reproduce GitHub's fork sync merge locally. On conflict the job fails
         # before the remote branch is touched; no automatic conflict resolution.
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@users.noreply.github.com"
           git merge --no-commit --no-ff refs/remotes/upstream/master
 
       - name: Install Zig 0.15.2
@@ -70,26 +75,33 @@ jobs:
           "$ZIG" version
           cargo build --release --locked
 
+  sync:
+    needs: validate
+    if: needs.validate.outputs.update == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
       - name: Verify refs are unchanged
-        if: steps.detect.outputs.update == 'true'
         shell: bash
-        # Do not sync a revision that was not covered by the preflight build.
+        # Keep write permission isolated from the job that executes upstream code.
+        # If either branch moved after validation, leave the fork untouched.
         run: |
-          git fetch https://github.com/herdrdev/herdr.git master:refs/remotes/upstream/master
-          git fetch origin local/tabby-cwd:refs/remotes/origin/local/tabby-cwd
-          CURRENT_UPSTREAM_SHA="$(git rev-parse refs/remotes/upstream/master)"
-          CURRENT_FORK_SHA="$(git rev-parse refs/remotes/origin/local/tabby-cwd)"
-          test "$CURRENT_UPSTREAM_SHA" = "${{ steps.detect.outputs.upstream_sha }}" || {
+          CURRENT_UPSTREAM_SHA="$(git ls-remote https://github.com/herdrdev/herdr.git refs/heads/master | awk '{print $1}')"
+          CURRENT_FORK_SHA="$(git ls-remote "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/local/tabby-cwd | awk '{print $1}')"
+          test -n "$CURRENT_UPSTREAM_SHA"
+          test -n "$CURRENT_FORK_SHA"
+          test "$CURRENT_UPSTREAM_SHA" = "${{ needs.validate.outputs.upstream_sha }}" || {
             echo "upstream moved during validation; retry on the next run" >&2
             exit 1
           }
-          test "$CURRENT_FORK_SHA" = "${{ steps.detect.outputs.fork_sha }}" || {
+          test "$CURRENT_FORK_SHA" = "${{ needs.validate.outputs.fork_sha }}" || {
             echo "fork branch moved during validation; retry on the next run" >&2
             exit 1
           }
 
       - name: Sync fork branch
-        if: steps.detect.outputs.update == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         # Use GitHub's fork-sync API instead of git push. This avoids PATs,
@@ -97,5 +109,7 @@ jobs:
         run: |
           gh api \
             --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
             "repos/${GITHUB_REPOSITORY}/merge-upstream" \
             -f branch='local/tabby-cwd'
