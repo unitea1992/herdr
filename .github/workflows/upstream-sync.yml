@@ -1,11 +1,6 @@
 name: sync fork with upstream
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - ".github/workflows/upstream-sync.yml"
   schedule:
     - cron: "0 3 * * 1" # weekly, Monday 03:00 UTC
   workflow_dispatch:
