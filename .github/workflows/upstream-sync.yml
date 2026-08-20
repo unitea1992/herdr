@@ -56,7 +56,10 @@ jobs:
         # Reproduce GitHub's fork sync merge locally. On conflict the job fails
         # before the remote branch is touched; no automatic conflict resolution.
         run: |
-          git merge --no-commit --no-ff refs/remotes/upstream/master
+          git \
+            -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            merge --no-commit --no-ff refs/remotes/upstream/master
 
       - name: Install Zig 0.15.2
         if: steps.detect.outputs.update == 'true'
