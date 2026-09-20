@@ -1,6 +1,6 @@
 ---
 name: triage
-description: Triage open herdr GitHub issues into a concise decision-first Markdown table. Use when the user says "triage", asks to triage open issues, asks which issues need attention, or wants issue priority/recommendation lights for herdr.
+description: Herdrのopen GitHub issueを優先度と次の対応でtriageするときに使う。
 ---
 
 # Herdr Issue Triage
