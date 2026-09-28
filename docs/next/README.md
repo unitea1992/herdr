@@ -66,7 +66,7 @@ enterprise / partnership: hey@herdr.dev
 
 ## agent instructions
 
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
+if you are an ai agent helping with this repository, follow [`CONTRIBUTING.md`](./CONTRIBUTING.md) and the current repository docs.
 
 ## development
 

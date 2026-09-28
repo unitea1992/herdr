@@ -66,7 +66,7 @@ herdr
 
 ## 智能体须知
 
-如果你是协助本仓库的 AI 智能体：在改动代码前阅读 [`AGENTS.md`](./AGENTS.md)，在创建 issue 或 PR 前阅读 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
+如果你是协助本仓库的 AI 智能体，请遵循 [`CONTRIBUTING.md`](./CONTRIBUTING.md) 和仓库中的当前文档。
 
 ## 开发
 
